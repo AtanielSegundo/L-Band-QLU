@@ -11,7 +11,7 @@ class BpskModem:
         self.link_bw       = link_bw
         self.roll_off      = roll_off
     
-    def modulate(self,bit_stream, snr_db=30.0, amplitude=1.0, fc=None, seed=None) -> Tuple[List[float],List[complex],ModulationInfo]:
+    def modulate(self,bit_stream, snr_db=30.0, amplitude=1.0, fc=None) -> Tuple[List[float],List[complex],ModulationInfo]:
         sampling_rate = self.sampling_rate
         link_bw       = self.link_bw
         roll_off      = self.roll_off
@@ -20,9 +20,6 @@ class BpskModem:
         bits = bit_stream
         symbol_rate = link_bw / (1.0 + roll_off)
 
-        if seed is not None:
-            np.random.seed(seed)
-            
         # I/Q is: +1 or -1 => O{i} = 0 or pi
         symbols = 1.0 - 2.0 * bits.astype(np.float32)  
         samples_per_symbol = sampling_rate / symbol_rate
