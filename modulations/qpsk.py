@@ -24,7 +24,7 @@ class QpskModem:
         self.link_bw       = link_bw
         self.roll_off      = roll_off
     
-    def modulate(self, bit_stream, snr_db=30.0, amplitude=1.0, fc=None) -> Tuple[List[float], List[complex], ModulationInfo]:
+    def modulate(self, bit_stream, snr_db=30.0, amplitude=1.0, fc=None, seed= None) -> Tuple[List[float], List[complex], ModulationInfo]:
         sampling_rate = self.sampling_rate
         link_bw       = self.link_bw
         roll_off      = self.roll_off
@@ -32,6 +32,9 @@ class QpskModem:
 
         bits = bit_stream
         
+        if seed is not None:
+            np.random.seed(seed)
+
         # QPSK: 2 bits per symbol
         # Pad bits to make even length
         if len(bits) % 2 != 0:
@@ -119,7 +122,7 @@ class QpskModem:
         
         return iq_t, complex_baseband_noisy.astype(np.complex64), info
     
-    def demodulate(self, qpsk_stream:List[float], info:ModulationInfo, amplitude=1.0, msb_first=False) -> List[int]:
+    def demodulate(self, qpsk_stream:List[float], info:ModulationInfo, amplitude=1.0) -> List[int]:
         n_bits = info.n_bits
         fs     = info.sampling_rate
         fc     = info.carrier_freq
@@ -136,7 +139,7 @@ class QpskModem:
         I = iq_t * cos_c
         Q = -iq_t * sin_c
 
-        # === LPF + filtro casado ===
+        # === LPF ===
         h = np.ones(sps, dtype=np.float32) / sps
         I = np.convolve(I, h, mode="same")
         Q = np.convolve(Q, h, mode="same")

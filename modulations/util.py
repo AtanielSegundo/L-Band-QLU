@@ -28,3 +28,9 @@ def bits_to_bytes(bits, msb_first=True):
         bytes_out.append(b)
 
     return bytearray(bytes_out)
+
+def tx_rx_error(tx_bytes,rx_bytes) -> float:
+    N = min(len(tx_bytes),len(rx_bytes))
+    xor_bytes = list(map(lambda p: p[0] ^ p[1], zip(tx_bytes,rx_bytes)))
+    not_equal_count = sum(map(lambda e: e != 0, xor_bytes))
+    return not_equal_count/ N
