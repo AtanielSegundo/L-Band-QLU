@@ -25,7 +25,6 @@ class Qam16Modem:
         return +3
 
     def _level_to_bits(self, level: int) -> Tuple[int,int]:
-        # inverse of above
         if level == -3:
             return (0,0)
         if level == -1:
@@ -34,13 +33,16 @@ class Qam16Modem:
             return (1,1)
         return (1,0)
 
-    def modulate(self, bit_stream, snr_db=30.0, amplitude=1.0, fc=None) -> Tuple[List[float], List[complex], ModulationInfo]:
+    def modulate(self, bit_stream, snr_db=30.0, amplitude=1.0, fc=None, seed= None) -> Tuple[List[float], List[complex], ModulationInfo]:
         fs = float(self.sampling_rate)
         B = float(self.link_bw)
         alpha = float(self.roll_off)
         
         if fc is None:
             fc = B / 4.0
+
+        if seed is not None:
+            np.random.seed(seed)
 
         bits = np.asarray(bit_stream, dtype=np.uint8)
 
@@ -54,8 +56,7 @@ class Qam16Modem:
 
         # samples per symbol (integer)
         sps = int(np.ceil(fs / symbol_rate))
-        if sps < 1:
-            sps = 1
+        if sps < 1: sps = 1
 
         # realign symbol_rate to integer sps
         symbol_rate = fs / sps
@@ -127,7 +128,7 @@ class Qam16Modem:
 
         return iq_t, complex_baseband_noisy.astype(np.complex64), info
 
-    def demodulate(self, stream: List[float], info: ModulationInfo, debug=False,enable_phase_corr=False) -> List[int]:
+    def demodulate(self, stream: List[float], info: ModulationInfo, debug=False) -> List[int]:
         n_bits = info.n_bits
         fs = float(info.sampling_rate)
         fc = info.carrier_freq
@@ -165,15 +166,6 @@ class Qam16Modem:
             return np.zeros(0, dtype=np.uint8)
 
         sym = bb_f[centers]
-
-        # FIX: Make phase correction optional
-        if enable_phase_corr:
-            try:
-                # Note: This requires many symbols to be accurate!
-                phi = np.angle(np.mean(sym ** 4)) / 4.0
-                sym = sym * np.exp(-1j * phi)
-            except Exception:
-                pass
 
         # limit to expected number of symbols (4 bits / symbol)
         n_symbols = min(len(sym), n_bits // 4)
@@ -260,7 +252,7 @@ class Qam16Modem:
         pts = np.array([[i, q] for i in levels for q in levels])
         ax2.scatter(pts[:,0], pts[:,1], s=100, marker='x', color='red', 
                     linewidths=2, label='Ideal', zorder=10)
-        ax2.set_title("Constellation - 16-QAM (sampled symbols)", fontsize=14, fontweight='bold')
+        ax2.set_title("Constellation - 16-QAM", fontsize=14, fontweight='bold')
         ax2.set_xlabel("I")
         ax2.set_ylabel("Q")
         ax2.set_ylim(-amplitude*1.5, amplitude*1.5)
