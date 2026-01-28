@@ -11,6 +11,8 @@ static inline void config_calculate_derived(mcu2_config_t *cfg) {
     cfg->samples_per_symbol = ceil(cfg->sampling_rate_hz / cfg->symbol_rate_hz);
 }
 
+typedef inline mcu2_config_t(*config_preset)(void);
+
 static inline double config_get_scale_factor(const mcu2_config_t *cfg) {
     /*
        Estimate the scale factor used in encoding.
@@ -52,7 +54,7 @@ static inline mcu2_config_t config_preset_qpsk_10mhz(void) {
 static inline mcu2_config_t config_preset_16qam_10mhz(void) {
     mcu2_config_t cfg = {
         .link_bw_hz = 10e6,
-        .sampling_rate_hz = 40e6,    // 4x oversampling for QAM
+        .sampling_rate_hz = 20e6, 
         .roll_off = 0.25,
         .signal_resolution = 16,
         .modulation = MOD_16QAM

@@ -28,7 +28,33 @@
         // Depends on modulation type
         uint8_t bits_per_symbol;     
         
-    } mcu2_config_t;
+    } demod_config_t;
+
+
+    typedef struct {
+        double acc_i;
+        double acc_q;
+        uint32_t count;
+    } symbol_acc_t;
+
+    typedef struct {
+        demod_config_t config;
+        double scale;
+        
+        uint32_t stream_idx;
+        symbol_acc_t sym;
+        
+        double sum_symbol_signal_power;
+        double sum_symbol_error_power;
+        uint64_t symbol_count;
+        
+        double sum_sample_signal_power;
+        double sum_sample_error_power;
+        uint64_t sample_count;
+    } demod_t;
+
+    // type := (symbol,sample) part := (signal,error)
+    #define GET_AVG_POWER(demod,type,part) ((demod)->sum_ ## type ## _ ## part ## _power / (demod)->sample_count)
 
     const int get_bits_per_symbol[] ={
         [MOD_BPSK]  = 1,

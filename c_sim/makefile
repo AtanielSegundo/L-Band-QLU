@@ -13,5 +13,5 @@ endif
 
 build: build/main.exe
 
-build/main.exe : src/main.c ../headers/complex_bpsk.h includes/mod_configs.h
+build/main.exe : src/main.c ../headers/complex_bpsk.h ../headers/complex_qpsk.h ../headers/complex_qam16.h includes/mod_configs.h
 	gcc $< -o $@ $(include_path) $(build_flags)
