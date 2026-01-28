@@ -14,9 +14,9 @@ def main():
     byte_stream = bytearray(stream_str,encoding="ascii")
 
     link_bw  = MegaHz(83.75)
-    link_bw  = MegaHz(51.25)
+    link_bw  = MegaHz(10.0)
 
-    sampling_rate = 4 * link_bw
+    sampling_rate = 2 * link_bw
     roll_off = 0.25
 
     print("[INFO] Starting I/Q Stream Generation")
@@ -25,8 +25,9 @@ def main():
     
     modems_cls = [BpskModem,QpskModem,Qam16Modem]
     
-    Fc     = MegaHz(1105)
-    SNR_db = 15.0
+    Fc     = 0.0
+    # Fc     = MegaHz(1105) 
+    SNR_db = 10
     SEED   = 333    
     
     # resolution dictates the bits by float data
