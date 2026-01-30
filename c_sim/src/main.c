@@ -17,7 +17,7 @@
 
 #define PRINT_EVERY_N_SYMBOLS 100
 
-#define COMPLEX_IQ  complex_qpsk
+#define COMPLEX_IQ  complex_qam16
 
 #define _CONCAT(a, b) a ## b
 #define CONCAT(a, b) _CONCAT(a, b)
@@ -38,8 +38,9 @@ int main(void) {
         .sampling_rate_hz = 20e6,
         .roll_off = 0.25,
         .signal_resolution = 16,
-        .modulation = MOD_QPSK
+        .modulation = MOD_16QAM
     };
+    config_calculate_derived(&cfg);
 
     demod_init(&demod,cfg);
     
@@ -192,9 +193,9 @@ void process_sample(demod_t *demod, int16_t i, int16_t q) {
             double gain_db = post_snr_db - pre_snr_db;
             double cn0_dbhz = post_snr_db + 10.0 * log10(demod->config.symbol_rate_hz);
 
-            printf("[MCU2] Sym=%5u | PRE: SNR=%5.2f dB EVM=%5.2f%% | "
-                   "POST: SNR=%5.2f dB EVM=%5.2f%% | Gain=%4.2f dB | C/N0=%5.2f dB-Hz\n",
-                   demod->symbol_count, pre_snr_db, pre_evm, 
+            printf("[MCU2] Sym=%5u | SNR=%5.2f dB | "
+                   "MER=%5.2f dB | EVM=%5.2f%% | Gain=%4.2f dB | C/N0=%5.2f dB-Hz\n",
+                   demod->symbol_count, pre_snr_db, 
                    post_snr_db, post_evm, gain_db, cn0_dbhz);
         }
     }

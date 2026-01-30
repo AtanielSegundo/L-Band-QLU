@@ -5,15 +5,13 @@
 #include <math.h>
 #include "base.h"
 
-static inline void config_calculate_derived(mcu2_config_t *cfg) {
+static inline void config_calculate_derived(demod_config_t *cfg) {
     cfg->bits_per_symbol = get_bits_per_symbol[cfg->modulation];
     cfg->symbol_rate_hz = cfg->link_bw_hz / (1.0 + cfg->roll_off);
     cfg->samples_per_symbol = ceil(cfg->sampling_rate_hz / cfg->symbol_rate_hz);
 }
 
-typedef inline mcu2_config_t(*config_preset)(void);
-
-static inline double config_get_scale_factor(const mcu2_config_t *cfg) {
+static inline double config_get_scale_factor(const demod_config_t *cfg) {
     /*
        Estimate the scale factor used in encoding.
        Python uses: scale = (half * 0.95) / max_abs
@@ -27,8 +25,8 @@ static inline double config_get_scale_factor(const mcu2_config_t *cfg) {
     return (double)(half * 0.95) / 1.5f;
 }
 
-static inline mcu2_config_t config_preset_bpsk_10mhz(void) {
-    mcu2_config_t cfg = {
+static inline demod_config_t config_preset_bpsk_10mhz(void) {
+    demod_config_t cfg = {
         .link_bw_hz = 10e6,          // 10 MHz
         .sampling_rate_hz = 20e6,    // 20 MHz (2x oversampling)
         .roll_off = 0.25,
@@ -39,8 +37,8 @@ static inline mcu2_config_t config_preset_bpsk_10mhz(void) {
     return cfg;
 }
 
-static inline mcu2_config_t config_preset_qpsk_10mhz(void) {
-    mcu2_config_t cfg = {
+static inline demod_config_t config_preset_qpsk_10mhz(void) {
+    demod_config_t cfg = {
         .link_bw_hz = 10e6,
         .sampling_rate_hz = 20e6,
         .roll_off = 0.25,
@@ -48,13 +46,13 @@ static inline mcu2_config_t config_preset_qpsk_10mhz(void) {
         .modulation = MOD_QPSK
     };
     config_calculate_derived(&cfg);
-    return cfg;
+    return cfg; 
 }
 
-static inline mcu2_config_t config_preset_16qam_10mhz(void) {
-    mcu2_config_t cfg = {
+static inline demod_config_t config_preset_16qam_10mhz(void) {
+    demod_config_t cfg = {
         .link_bw_hz = 10e6,
-        .sampling_rate_hz = 20e6, 
+        .sampling_rate_hz = 20e6,
         .roll_off = 0.25,
         .signal_resolution = 16,
         .modulation = MOD_16QAM
