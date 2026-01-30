@@ -1,0 +1,4 @@
+build
+!.vscode/*
+libs/FreeRTOS-Kernel/*
+!libs/FreeRTOS-Kernel/.gitkeep
