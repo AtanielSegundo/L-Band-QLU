@@ -23,7 +23,9 @@ if (EXISTS ${picoVscode})
     include(${picoVscode})
 endif()
 # ====================================================================================
+
 set(PICO_BOARD pico_w CACHE STRING "Board type")
+set(FREERTOS_KERNEL_PATH ${CMAKE_CURRENT_SOURCE_DIR}/libs/FreeRTOS-Kernel)
 
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
@@ -33,13 +35,22 @@ project(QLU C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# Add executable. Default name is the project name, version 0.1
+# Add executable. Default name is the project name
+include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_import.cmake)
 
 add_executable(QLU 
-               src/QLU.c )
+               src/QLU.c 
+               ${FREERTOS_KERNEL_PATH}/portable/MemMang/heap_4.c
+               )
 
 pico_set_program_name(QLU "QLU")
 pico_set_program_version(QLU "0.1")
+
+add_compile_options(-Wall
+        -Wno-format          
+        -Wno-unused-function 
+        -Wno-maybe-uninitialized
+        )
 
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(QLU 0)
@@ -48,7 +59,10 @@ pico_enable_stdio_usb(QLU 1)
 # Add the standard library to the build
 target_link_libraries(QLU
         ${CMAKE_CURRENT_LIST_DIR}
-        pico_stdlib)
+        pico_stdlib
+        FreeRTOS-Kernel
+        pico_multicore
+    )
 
 # Add the standard include files to the build
 target_include_directories(QLU PRIVATE
@@ -64,15 +78,10 @@ add_subdirectory(libs/QRcode)
 
 # Add any user requested libraries
 
-add_compile_options(-Wall
-        -Wno-format          
-        -Wno-unused-function 
-        -Wno-maybe-uninitialized
-        )
-
 target_link_libraries(QLU 
         hardware_spi
         hardware_dma
+        hardware_i2c
         # picow_websockets
         st7735
         gfx

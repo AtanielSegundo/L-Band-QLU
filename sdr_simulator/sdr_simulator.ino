@@ -7,6 +7,8 @@
 #define PIN_NUM_CLK   12
 #define PIN_NUM_CS    10
 
+const uint8_t SYNC_HEADER[4] = {0xFE, 0xCA, 0xFE, 0xCA};
+
 struct SimulationConfig {
     Modulations modulation;
     int snr;
@@ -184,8 +186,15 @@ void transmissionTask(void *pvParameters) {
     tx_ptr = GET_DATA(BPSK, available_snr[0]);
     meta_ptr = GET_META(BPSK, available_snr[0]);
     
+    size_t chunk_size_samples = 256;
+    size_t payload_size = chunk_size_samples * sizeof(stream_data_t); // 256 * 4 bytes
+    size_t total_size = sizeof(SYNC_HEADER) + payload_size;
+
     SimulationConfig rxConfig;
     spi_transaction_t t;
+
+    uint8_t *tx_buffer = (uint8_t*) heap_caps_malloc(total_size, MALLOC_CAP_DMA);
+    memcpy(tx_buffer, SYNC_HEADER, sizeof(SYNC_HEADER));
 
     Serial.println("[Core 1] Transmission Task Started with Precise Timing");
 
@@ -202,10 +211,11 @@ void transmissionTask(void *pvParameters) {
             
             // Se o sample rate for muito alto (ex: 20MHz), a duração alvo pode ser 0 ou muito baixa.
             // Nesse caso, roda-se no máximo que o SPI aguentar.
+            memcpy(tx_buffer + 4, tx_ptr, payload_size);
 
             data_len_bytes = meta_ptr->n_samples * sizeof(stream_data_t);
-            t.length = data_len_bytes * 8;
-            t.tx_buffer = tx_ptr;
+            t.length = total_size * 8;
+            t.tx_buffer = tx_buffer;
             t.rx_buffer = NULL; // Garante que não queremos receber nada
             t.rxlength = 0;     // Garante que o tamanho esperado de RX é 0
 
@@ -261,7 +271,7 @@ void initSPI() {
         .duty_cycle_pos = 128,      // 50% duty cycle
         .cs_ena_pretrans = 0,
         .cs_ena_posttrans = 0,
-        .clock_speed_hz = 40 * 1000 * 1000, // 40 MHz (Clock Base)
+        .clock_speed_hz = 4 * 1000 * 1000, // 40 MHz (Clock Base)
         .spics_io_num = PIN_NUM_CS,
         .queue_size = 1,            // Tamanho da fila de transações
         // .pre_cb = NULL,          // Callback antes da transação

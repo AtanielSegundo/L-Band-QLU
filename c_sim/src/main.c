@@ -19,6 +19,7 @@
 
 #define COMPLEX_IQ  complex_qam16
 
+
 #define _CONCAT(a, b) a ## b
 #define CONCAT(a, b) _CONCAT(a, b)
 
@@ -200,6 +201,7 @@ void process_sample(demod_t *demod, int16_t i, int16_t q) {
         }
     }
 }
+
 
 void print_final_stats(const demod_t *demod) {
     printf("\n========================================================================\n");

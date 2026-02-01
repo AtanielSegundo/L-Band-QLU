@@ -4,7 +4,6 @@
 
 #include "base.h"
 
-
 inline double slicer_calculate_power(double i, double q){
     return (i * i + q * q);
 }

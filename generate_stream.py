@@ -72,7 +72,6 @@ def calculate_cn0(complex_iq, sampling_rate, modem):
     return cn0_dbhz
 
 def main():
-    #stream_str   = open("generate_stream.py","r").read()
     stream_str = "Hello IQ Stream"
     byte_stream = bytearray(stream_str,encoding="ascii")
 
@@ -89,8 +88,10 @@ def main():
     modems_cls = [BpskModem,QpskModem,Qam16Modem]
     
     Fc = 0.0
-      # Fc     = MegaHz(1105) 
-    SNR_db    = 10
+    # Fc     = MegaHz(1105) 
+    
+    SNR_db    = 15
+    
     SEED      = 333
     AMPLITUDE = 1.0
     
@@ -99,39 +100,39 @@ def main():
     # in complex_iq is the same but for each I Q pair, so I[0] is 16 bits and Q[0] is 16 bits too
     h_converter = ToHeaderConverter(resolution=16)
 
-    # print("-----------------------------------------------------------------------------")
-    # for modem_cls in modems_cls:
-    #     modem = modem_cls(sampling_rate,link_bw,roll_off)
-    #     modem_name = type(modem).__name__
+    print("-----------------------------------------------------------------------------")
+    for modem_cls in modems_cls:
+        modem = modem_cls(sampling_rate,link_bw,roll_off)
+        modem_name = type(modem).__name__
 
-    #     iq_t, complex_iq, info = modem.modulate(bit_stream,fc=Fc,snr_db=SNR_db,seed=SEED,
-    #                                             amplitude=AMPLITUDE)
-    #     _, zer_complex_iq, _ = modem.modulate(bit_stream,fc=0.0,snr_db=SNR_db,seed=SEED,
-    #                                           amplitude=AMPLITUDE)
-    #     zer_eq = sum(complex_iq == zer_complex_iq) / (min(len(complex_iq),len(zer_complex_iq)))
-    #     print("ZERO == CARRIER IQ? ",bool(zer_eq))
+        iq_t, complex_iq, info = modem.modulate(bit_stream,fc=Fc,snr_db=SNR_db,seed=SEED,
+                                                amplitude=AMPLITUDE)
+        _, zer_complex_iq, _ = modem.modulate(bit_stream,fc=0.0,snr_db=SNR_db,seed=SEED,
+                                              amplitude=AMPLITUDE)
+        zer_eq = sum(complex_iq == zer_complex_iq) / (min(len(complex_iq),len(zer_complex_iq)))
+        print("ZERO == CARRIER IQ? ",bool(zer_eq))
         
-    #     cn0_est = calculate_cn0(complex_iq, sampling_rate, modem)
+        cn0_est = calculate_cn0(complex_iq, sampling_rate, modem)
 
-    #     modem.plot(f"plots/test_{modem_name}.png",iq_t,complex_iq,info)
-    #     dem_bit_stream = modem.demodulate(iq_t,info)
-    #     dem_bytes = bits_to_bytes(dem_bit_stream,msb_first=True)
+        modem.plot(f"plots/test_{modem_name}.png",iq_t,complex_iq,info)
+        dem_bit_stream = modem.demodulate(iq_t,info)
+        dem_bytes = bits_to_bytes(dem_bit_stream,msb_first=True)
 
-    #     h_name = modem_name.split("Modem")[0].lower()
+        h_name = modem_name.split("Modem")[0].lower()
         
-    #     # h_converter.real_st(iq_t,info,save_path=f"headers/{h_name}.h",
-    #     #                     arr_name=h_name,
-    #     #                     elem_per_line=7)
+        # h_converter.real_st(iq_t,info,save_path=f"headers/{h_name}.h",
+        #                     arr_name=h_name,
+        #                     elem_per_line=7)
         
-    #     h_converter.complex_st(complex_iq,info,save_path=f"headers/complex_{h_name}.h",
-    #                            arr_name="complex_"+h_name,
-    #                            elem_per_line=7)
+        h_converter.complex_st(complex_iq,info,save_path=f"headers/complex_{h_name}.h",
+                               arr_name="complex_"+h_name,
+                               elem_per_line=7)
 
-    #     print(f"{modem_name} Bit rate: {info.bit_rate}")
-    #     print("OK:", dem_bytes == byte_stream)
-    #     print(f"  C/N0:     {cn0_est:.2f} dB-Hz (Est)")
-    #     print(f"Error: {round(tx_rx_error(byte_stream,dem_bytes) * 100,2)}%")
-    #     print("-----------------------------------------------------------------------------")
+        print(f"{modem_name} Bit rate: {info.bit_rate}")
+        print("OK:", dem_bytes == byte_stream)
+        print(f"  C/N0:     {cn0_est:.2f} dB-Hz (Est)")
+        print(f"Error: {round(tx_rx_error(byte_stream,dem_bytes) * 100,2)}%")
+        print("-----------------------------------------------------------------------------")
 
 
     print("[INFO] Starting I/Q Stream Generation For SDR SIMULATOR")

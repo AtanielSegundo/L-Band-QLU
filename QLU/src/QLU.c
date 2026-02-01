@@ -3,6 +3,7 @@
     #include <stdio.h>
     #include "pico/stdlib.h"
     #include "hardware/spi.h"
+    #include "hardware/dma.h"
 
 // END
 
@@ -11,78 +12,591 @@
     #include "fonts/freeMono9.h"
     #include "fonts/freeMono6.h"
 
+    #include "FreeRTOS.h"
+    #include "task.h"
+    #include "queue.h"
+    #include "semphr.h"
+
 //  END
 
 // PROJECT INNER LIBRARIES
 
     #include "qlu_base.h"
+    
+    #define PROCESS_BLOCK_SIZE 256
+    #include "qlu_demod.h"
+    
+    // #define SCREEN_IS_ST7735
+    #define SCREEN_IS_SSD1306
+
     #include "screen.h"
 
 // END
 
-int ST7735_EXAMPLE_1(){
+// QLU CONST DEFINITIONS
+
+    #define SPI_PORT spi0
+    #define PIN_RX   16
+    #define PIN_CSN  17
+    #define PIN_SCK  18
+    #define PIN_TX   19
+
+    // --- Configurações de Buffer ---
+    #define DMA_BUFFER_SIZE 4096 
+    uint8_t __attribute__((aligned(DMA_BUFFER_SIZE))) rx_ring_buffer[DMA_BUFFER_SIZE];
+
+    QueueHandle_t xDspQueue;
+    int dma_chan;
+
+// END
+
+
+// QLU TEST DEFINITIONS
+
+#define DEMOD_TEST
+#undef DEMOD_TEST
+
+#ifdef DEMOD_TEST
+    #include "complex_bpsk_13.h"
+    #include "complex_qam16_13.h"
+    #include "complex_qpsk_13.h"
+    #define COMPLEX_IQ  complex_qam16_13
+    #define _CONCAT(a, b) a ## b
+    #define CONCAT(a, b) _CONCAT(a, b)
+    #define COMPLEX_IQ_META CONCAT(COMPLEX_IQ, _meta)
+
+#endif
+
+// END
+
+
+// SPI STREAM HANDLING DEFINITIONS
+
+    #define SYNC_BYTE_0 0xFE
+    #define SYNC_BYTE_1 0xCA
+    #define SYNC_BYTE_2 0xFE
+    #define SYNC_BYTE_3 0xCA
+    #define PAYLOAD_SIZE (256 * 4)
+
+    typedef enum {
+        STATE_SYNC_0, // Procurando 0xFE
+        STATE_SYNC_1, // Procurando 0xCA
+        STATE_SYNC_2, // Procurando 0xFE
+        STATE_SYNC_3, // Procurando 0xCA
+        STATE_PAYLOAD // Lendo dados
+    } SyncState;
+
+// END
+
+
+void setup_spi_dma() {
+    // 1. Configura SPI Slave
+    spi_init(SPI_PORT, 4 * 1000 * 1000);
+    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    spi_set_slave(SPI_PORT, true);
+    
+    gpio_set_function(PIN_RX, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_SCK, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_CSN, GPIO_FUNC_SPI);
+    gpio_set_function(PIN_TX, GPIO_FUNC_SPI);
+
+    // 2. Configura DMA
+    dma_chan = dma_claim_unused_channel(true);
+    dma_channel_config c = dma_channel_get_default_config(dma_chan);
+
+    // Transfere bytes
+    channel_config_set_transfer_data_size(&c, DMA_SIZE_8); 
+    // Lê sempre do mesmo reg SPI
+    channel_config_set_read_increment(&c, false); 
+    // Escreve incrementando na RAM para cada amostra
+    channel_config_set_write_increment(&c, true); 
+    // Sincroniza com RX do SPI
+    channel_config_set_dreq(&c, spi_get_dreq(SPI_PORT, false)); 
+    
+    // Configura o Ring Buffer no DMA
+    // 12 bits -> 4096 bytes (2^12)
+    channel_config_set_ring(&c, true, 12); 
+
+    dma_channel_configure(
+        dma_chan,
+        &c,
+        rx_ring_buffer,        
+        &spi_get_hw(SPI_PORT)->dr, 
+        0xFFFFFFFF,            // Número de transferências (infinito/max)
+        true                   // Iniciar imediatamente
+    );
+}
+
+void peripherals_setup(void){
     stdio_init_all();
+    
+    #ifdef SCREEN_IS_ST7735
+        screen_init_setup(INITR_BLACKTAB,SCREEN_VERTICAL,&FreeMono6pt8b);
+    #endif
 
-    // ST7735 SETUP
-    screen_init_setup(INITR_BLACKTAB,SCREEN_VERTICAL,&FreeMono6pt8b);
-    QLUMetrics m_qm = {.mer=18.0,.cn0=89.0,.evm=0.28};
-    QRCodeGenerated qr_gen = {0};
+    #ifdef SCREEN_IS_SSD1306
+        ssd1306_i2c_setup();
+        clear_screen();
+    #endif
+    
+    setup_spi_dma();
+}
 
-    generate_qr_code(&qr_gen,&SMALL_QR_CONFIG,"http://QLU/dashboard");
-    fill_with_qr_code_bottom(&qr_gen);    
 
-    while (true) {
-        m_qm.mer += 0.1; 
-        m_qm.cn0 += 0.05; 
-        m_qm.evm += 0.01; 
-        write_boxed_metrics(5,6,ST77XX_BLUE,&m_qm);
-        sleep_ms(500);
+static inline int32_t uint16_to_signed(uint16_t raw, uint8_t resolution) {
+    // // Correção: half deve ser 2^(resolution-1), não (2^resolution - 1) / 2
+    // uint32_t half = (1u << (resolution - 1));  // Para 16 bits: 32768 (não 32767!)
+    // int32_t tmp = (int32_t)raw - (int32_t)half;
+    
+    uint32_t max_uint = ((1u << resolution) - 1u);
+    uint32_t half = max_uint / 2u;
+    int32_t tmp = (int32_t)raw - (int32_t)half;
+
+    if (tmp < -32768) tmp = -32768;
+    if (tmp >  32767) tmp =  32767;
+    
+    return tmp;
+}
+
+
+void demod_init(demod_t *demod,demod_config_t cfg) {
+    demod->config                  = cfg;
+    demod->scale                   = config_get_scale_factor(&demod->config);
+    demod->stream_idx              = 0;
+    demod->sym                     = (symbol_acc_t){0, 0, 0};
+    demod->sum_symbol_signal_power = 0.0;
+    demod->sum_symbol_error_power  = 0.0;
+    demod->symbol_count            = 0;
+    demod->sum_sample_signal_power = 0.0;
+    demod->sum_sample_error_power  = 0.0;
+    demod->sample_count            = 0;
+}
+
+// PROJECT TASKS 
+
+// Defina o fator de suavização (0.0 a 1.0)
+// 0.05 = Resposta lenta, muito estável (bom para números que pulam muito)
+// 0.20 = Resposta rápida, menos estável
+#define EMA_ALPHA 0.1 
+
+void UpdateScreenTask(void* params){
+    QLUMetrics m_qm = {0};
+    
+    // Variáveis estáticas para manter o valor entre iterações
+    static double smooth_snr = 0.0;
+    static double smooth_mer = 0.0;
+    static double smooth_evm = 0.0;
+    static double smooth_cn0 = 0.0;
+    static bool first_run = true;
+
+    #ifdef SCREEN_IS_ST7735
+        QRCodeGenerated qr_gen = {0};
+        generate_qr_code(&qr_gen,&SMALL_QR_CONFIG,"http://QLU/dashboard.local");
+        fill_with_qr_code_bottom(&qr_gen);
+    #endif 
+
+    IqBlock_t rxBlock;
+    demod_t demod;
+
+    // Configuração (Mantenha a sua configuração atual)
+    demod_config_t cfg = {
+        .link_bw_hz = 10e6,
+        .sampling_rate_hz = 20e6,
+        .roll_off = 0.25,
+        .signal_resolution = 16,
+        .modulation = MOD_16QAM
+    };
+    config_calculate_derived(&cfg);
+    demod_init(&demod,cfg);
+
+    uint32_t sps_ceil = (uint32_t)ceil(demod.config.samples_per_symbol);
+
+    // Variáveis temporárias (Instantâneas)
+    double inst_mer = 0.0;
+    double inst_snr = 0.0;
+    double inst_evm = 0.0;
+    double inst_cn0 = 0.0;
+
+    // ... (Variáveis auxiliares de loop: raw_i, fi, result, etc mantidas iguais) ...
+    // NEEDED VARIABLES FOR CALCULATIONS (Copie as do seu código anterior)
+    float        signal_power      = 0.0f;
+    uint16_t     raw_i             = 0u;
+    uint16_t     raw_q             = 0u;
+    int32_t      halfed_i          = 0;
+    int32_t      halfed_q          = 0;
+    double       fi                = 0.0;
+    double       fq                = 0.0;
+    SlicerResult result            = {0};
+    double       rx_i              = 0.0;
+    double       rx_q              = 0.0;
+    double       error_i           = 0.0;
+    double       error_q           = 0.0;
+    double       ideal_power       = 0.0;
+    double       error_power       = 0.0;
+
+    // Variáveis de cálculo de média
+    double avg_sym_sig_power = 0.0;
+    double avg_sym_err_power = 0.0;
+    double avg_smp_sig       = 0.0;
+    double avg_smp_err       = 0.0;
+
+    uint32_t blocks_since_reset = 0;
+    const uint32_t RESET_EVERY_N_BLOCKS = 2;
+
+    while (true)
+    {
+        if (xQueueReceive(xDspQueue, &rxBlock, portMAX_DELAY) == pdPASS) {
+            
+            // 1. Processa o bloco (Acumula estatísticas instantâneas)
+            for(int k=0; k<PROCESS_BLOCK_SIZE; k++) {
+                // ... (CÓDIGO DO LOOP FOR IDÊNTICO AO ANTERIOR) ...
+                // Copie a lógica de conversão, slicer e demod.sum_... += ...
+                
+                raw_i = rxBlock.i_samples[k];
+                raw_q = rxBlock.q_samples[k];
+                halfed_i = uint16_to_signed(raw_i,demod.config.signal_resolution);
+                halfed_q = uint16_to_signed(raw_q,demod.config.signal_resolution);
+                fi = (double)halfed_i / demod.scale;
+                fq = (double)halfed_q / demod.scale;                
+
+                // Sample level (Pre-SNR)
+                result = get_slicer_by_mod[demod.config.modulation](fi,fq);
+                demod.sum_sample_signal_power += slicer_calculate_power(result.ideal_i,result.ideal_q);
+                demod.sum_sample_error_power  += slicer_calculate_power(fi - result.ideal_i, fq - result.ideal_q);
+                demod.sample_count++;
+
+                // Symbol level (Post-SNR / MER)
+                demod.sym.acc_i += fi;
+                demod.sym.acc_q += fq;
+                demod.sym.count++;
+                
+                if (demod.sym.count >= sps_ceil){
+                    rx_i = demod.sym.acc_i / (double)demod.sym.count;
+                    rx_q = demod.sym.acc_q / (double)demod.sym.count;
+                    result = get_slicer_by_mod[demod.config.modulation](rx_i,rx_q);
+                    
+                    demod.sum_symbol_signal_power += slicer_calculate_power(result.ideal_i,result.ideal_q);
+                    demod.sum_symbol_error_power += slicer_calculate_power(rx_i - result.ideal_i, rx_q - result.ideal_q);
+                    demod.symbol_count++;
+
+                    demod.sym.acc_i = 0.0;
+                    demod.sym.acc_q = 0.0;
+                    demod.sym.count = 0;            
+                }   
+            }
+
+            // 2. Calcula métricas INSTANTÂNEAS (deste bloco apenas)
+            // -----------------------------------------------------------
+            avg_sym_sig_power = (demod.symbol_count > 0) ? (demod.sum_symbol_signal_power / demod.symbol_count) : 0.0;
+            avg_sym_err_power = (demod.symbol_count > 0) ? (demod.sum_symbol_error_power / demod.symbol_count) : 0.0;
+            
+            if (avg_sym_err_power > 0.000001 && avg_sym_sig_power > 0.000001) {
+                inst_mer = 10.0 * log10(avg_sym_sig_power / avg_sym_err_power);
+                inst_evm = sqrt(avg_sym_err_power / avg_sym_sig_power) * 100.0;
+            } else {
+                inst_mer = 0.0;
+                inst_evm = 0.0;
+            }
+
+            avg_smp_sig = (demod.sample_count > 0) ? (demod.sum_sample_signal_power / demod.sample_count) : 0.0;
+            avg_smp_err = (demod.sample_count > 0) ? (demod.sum_sample_error_power / demod.sample_count) : 0.0;
+            
+            if (avg_smp_err > 0.000001) {
+                inst_snr = 10.0 * log10(avg_smp_sig / avg_smp_err);
+            } else {
+                inst_snr = 0.0;
+            }
+            inst_cn0 = inst_mer + 10.0 * log10(demod.config.symbol_rate_hz);
+            
+            if (first_run) {
+                smooth_mer = inst_mer;
+                smooth_snr = inst_snr;
+                smooth_evm = inst_evm;
+                smooth_cn0 = inst_cn0;
+                first_run = false;
+            } else {
+                smooth_mer = (EMA_ALPHA * inst_mer) + ((1.0 - EMA_ALPHA) * smooth_mer);
+                smooth_snr = (EMA_ALPHA * inst_snr) + ((1.0 - EMA_ALPHA) * smooth_snr);
+                smooth_evm = (EMA_ALPHA * inst_evm) + ((1.0 - EMA_ALPHA) * smooth_evm);
+                smooth_cn0 = (EMA_ALPHA * inst_cn0) + ((1.0 - EMA_ALPHA) * smooth_cn0);
+            }
+
+            // 4. Prepara dados para tela usando valores suavizados
+            m_qm.snr = smooth_snr;
+            m_qm.mer = smooth_mer;
+            m_qm.evm = smooth_evm;
+            m_qm.cn0 = smooth_cn0;
+
+            blocks_since_reset++;
+            if (blocks_since_reset >= RESET_EVERY_N_BLOCKS) {
+                demod.sum_symbol_signal_power = 0.0;
+                demod.sum_symbol_error_power  = 0.0;
+                demod.symbol_count            = 0;
+                demod.sum_sample_signal_power = 0.0;
+                demod.sum_sample_error_power  = 0.0;
+                demod.sample_count            = 0;
+                blocks_since_reset = 0;
+            }
+        }
+
+        #ifdef SCREEN_IS_ST7735
+            write_boxed_metrics(5,6,ST77XX_BLUE,&m_qm);
+        #endif
+
+        #ifdef SCREEN_IS_SSD1306
+            write_boxed_metrics(5,6,8,&m_qm);
+        #endif
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
+
+void SPIStreamTask(void* params){
+    static uint32_t tail_index = 0;
+    IqBlock_t txBlock;
+    static bool print_once = true;  // ADICIONAR
+
+    printf("[Core 0] Acquisition Task Iniciada\n");
+
+    while(true) {
+        uint32_t current_write_addr = (uint32_t)dma_hw->ch[dma_chan].write_addr;
+        uint32_t head_index = current_write_addr - (uint32_t)rx_ring_buffer;
+
+        uint32_t available_bytes;
+        if (head_index >= tail_index) {
+            available_bytes = head_index - tail_index;
+        } else {
+            available_bytes = (DMA_BUFFER_SIZE - tail_index) + head_index;
+        }
+
+        size_t bytes_needed = PROCESS_BLOCK_SIZE * 4;
+        
+        if (available_bytes >= bytes_needed) {
+            
+            for (int i = 0; i < PROCESS_BLOCK_SIZE; i++) {
+                
+                uint8_t b0 = rx_ring_buffer[(tail_index + 0) % DMA_BUFFER_SIZE];
+                uint8_t b1 = rx_ring_buffer[(tail_index + 1) % DMA_BUFFER_SIZE];
+                uint8_t b2 = rx_ring_buffer[(tail_index + 2) % DMA_BUFFER_SIZE];
+                uint8_t b3 = rx_ring_buffer[(tail_index + 3) % DMA_BUFFER_SIZE];
+
+                txBlock.i_samples[i] = (uint16_t)((b1 << 8) | b0);
+                txBlock.q_samples[i] = (uint16_t)((b3 << 8) | b2);
+                
+                
+                // DIAGNÓSTICO - imprimir primeira amostra de cada bloco
+                if (i == 0 && print_once) {
+                    printf("[SPI Debug] Bytes: %02X %02X %02X %02X -> I=%u Q=%u\n",
+                           b0, b1, b2, b3, 
+                           txBlock.i_samples[i], txBlock.q_samples[i]);
+                }
+                
+                tail_index = (tail_index + 4) % DMA_BUFFER_SIZE;
+            }
+            
+            print_once = false;  // Printar apenas primeiro bloco
+            
+            if (xQueueSend(xDspQueue, &txBlock, 0) != pdTRUE) {
+                // printf("Drop!\n"); 
+            }
+
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+    }
+}
+
+
+void SPISyncedStreamTask(void* params){
+    static uint32_t tail_index = 0;
+    static SyncState current_state = STATE_SYNC_0;
+    static uint16_t payload_idx = 0;
+    static uint8_t temp_payload_buffer[PAYLOAD_SIZE]; // Buffer temporário para montar o pacote
+    
+    IqBlock_t txBlock;
+
+    printf("[Core 1] Iniciando Sincronizacao de Frame...\n");
+
+    while(true) {
+        uint32_t current_write_addr = (uint32_t)dma_hw->ch[dma_chan].write_addr;
+        uint32_t head_index = current_write_addr - (uint32_t)rx_ring_buffer;
+        
+        if (head_index == tail_index) {
+            vTaskDelay(1); 
+            continue;
+        }
+
+        // Processa byte a byte do Ring Buffer
+        while(tail_index != head_index) {
+            uint8_t byte = rx_ring_buffer[tail_index];
+            tail_index = (tail_index + 1) % DMA_BUFFER_SIZE;
+
+            switch (current_state) {
+                // --- MÁQUINA DE ESTADOS DE SINCRONIA ---
+                case STATE_SYNC_0:
+                    if (byte == SYNC_BYTE_0) current_state = STATE_SYNC_1;
+                    break;
+                case STATE_SYNC_1:
+                    if (byte == SYNC_BYTE_1) current_state = STATE_SYNC_2;
+                    else current_state = STATE_SYNC_0; // Reset se falhar
+                    break;
+                case STATE_SYNC_2:
+                    if (byte == SYNC_BYTE_2) current_state = STATE_SYNC_3;
+                    else current_state = STATE_SYNC_0;
+                    break;
+                case STATE_SYNC_3:
+                    if (byte == SYNC_BYTE_3) {
+                        current_state = STATE_PAYLOAD;
+                        payload_idx = 0; // Preparar para ler payload
+                    } else {
+                        current_state = STATE_SYNC_0;
+                    }
+                    break;
+
+                // --- ESTADO DE LEITURA DE DADOS ---
+                case STATE_PAYLOAD:
+                    temp_payload_buffer[payload_idx++] = byte;
+
+                    if (payload_idx >= PAYLOAD_SIZE) {
+                        // Pacote completo recebido! Agora processamos.
+                        
+                        for (int i = 0; i < 256; i++) {
+                            // ATENÇÃO: Endianness corrigido aqui (Little Endian)
+                            // Buffer bruto: [LSB_I, MSB_I, LSB_Q, MSB_Q]
+                            uint8_t b0 = temp_payload_buffer[i*4 + 0];
+                            uint8_t b1 = temp_payload_buffer[i*4 + 1];
+                            uint8_t b2 = temp_payload_buffer[i*4 + 2];
+                            uint8_t b3 = temp_payload_buffer[i*4 + 3];
+
+                            // Reconstrói int16
+                            txBlock.i_samples[i] = (uint16_t)((b1 << 8) | b0);
+                            txBlock.q_samples[i] = (uint16_t)((b3 << 8) | b2);
+                        }
+
+                        // Envia para a fila de DSP
+                        xQueueSend(xDspQueue, &txBlock, 0);
+
+                        // Volta a procurar o próximo header
+                        current_state = STATE_SYNC_0;
+                    }
+                    break;
+            }
+        }
+    }
+}
+
+#ifdef DEMOD_TEST
+
+void SPITestStreamTask(void* params){
+    IqBlock_t txBlock;
+    
+    printf("[Core 0] Test Acquisition Task Iniciada\n");
+    const size_t total_values = COMPLEX_IQ_META.n_samples;  // Total de valores no array
+    size_t read_index = 0U;  // Índice de leitura no array intercalado
+    
+    while(true) {
+        // Lê PROCESS_BLOCK_SIZE pares I/Q do array intercalado
+        for(size_t i = 0; i < PROCESS_BLOCK_SIZE; i++){
+            // Cada par I/Q ocupa 2 posições consecutivas
+            size_t base_idx = read_index + (2 * i);
+            txBlock.i_samples[i] = (uint16_t)(COMPLEX_IQ[(base_idx + 0) % total_values]);  // I
+            txBlock.q_samples[i] = (uint16_t)(COMPLEX_IQ[(base_idx + 1) % total_values]);  // Q
+        }
+        
+        // Avança o índice pelo número de VALORES lidos (não pares!)
+        // Lemos 256 pares = 512 valores
+        read_index = (read_index + PROCESS_BLOCK_SIZE * 2) % total_values;
+        
+        if (xQueueSend(xDspQueue, &txBlock, 0) != pdTRUE) {
+            // printf("Drop!\n"); 
+        }
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
+
+#endif
+
+// END
 
 int main()
 {
-    stdio_init_all();
+    peripherals_setup();
+    sleep_ms(2000);
+        printf("[INFO] SYSTEM STARTING...\n");    
+    sleep_ms(2000);
+        printf("[INFO] SYSTEM STARTED...\n");
 
-    // ST7735 SETUP
-    screen_init_setup(INITR_BLACKTAB,SCREEN_VERTICAL,&FreeMono6pt8b);
-    QLUMetrics m_qm = {.mer=18.0,.cn0=89.0,.evm=0.28};
-    QRCodeGenerated qr_gen = {0};
+    xDspQueue = xQueueCreate(10, sizeof(IqBlock_t));
 
-    generate_qr_code(&qr_gen,&SMALL_QR_CONFIG,"http://QLU/dashboard");
-    fill_with_qr_code_bottom(&qr_gen);    
+    
+    #ifdef DEMOD_TEST
+         // Core 1: Gerencia o buffer DMA e monta os pacotes para o processamento
+        xTaskCreateAffinitySet(
+            SPITestStreamTask, 
+            "SPI Test Stream Handling Task", 
+            4096, 
+            NULL, 
+            10,      
+            RP2040_CORE_1,
+            NULL
+        );
+    #else
+        // Core 1: Gerencia o buffer DMA e monta os pacotes para o processamento
+        xTaskCreateAffinitySet(
+            SPISyncedStreamTask, 
+            "SPI Stream Handling Task", 
+            4096, 
+            NULL, 
+            10,      
+            RP2040_CORE_1,
+            NULL
+        );
+    #endif
+
+    // Core 0: Gerencia o Screen e processa os dados recebidos na fila
+    xTaskCreateAffinitySet(
+        UpdateScreenTask,
+        "Screen Update Task",
+        4096,
+        NULL,
+        5,
+        RP2040_CORE_0,
+        NULL
+    );
+
+    vTaskStartScheduler();
 
     while (true) {
-        m_qm.mer += 0.1; 
-        m_qm.cn0 += 0.05; 
-        m_qm.evm += 0.01; 
-        write_boxed_metrics(5,6,ST77XX_BLUE,&m_qm);
-        sleep_ms(500);
+        tight_loop_contents();
     }
 }
 
-/*
-[Ataniel - Testing Screen]
 
-*/
 
-// SPI Defines
-// We are going to use SPI 0, and allocate it to the following GPIO pins
-// Pins can be changed, see the GPIO function select table in the datasheet for information on GPIO assignments
-// #define SPI_PORT spi0
-// #define PIN_MISO 16
-// #define PIN_CS   17
-// #define PIN_SCK  18
-// #define PIN_MOSI 19
 
-// SPI initialisation. This example will use SPI at 1MHz.
-// spi_init(SPI_PORT, 1000*1000);
-// gpio_set_function(PIN_MISO, GPIO_FUNC_SPI);
-// gpio_set_function(PIN_CS,   GPIO_FUNC_SIO);
-// gpio_set_function(PIN_SCK,  GPIO_FUNC_SPI);
-// gpio_set_function(PIN_MOSI, GPIO_FUNC_SPI);
+// EXAMPLES
 
-// Chip select is active-low, so we'll initialise it to a driven-high state
-// gpio_set_dir(PIN_CS, GPIO_OUT);
-// gpio_put(PIN_CS, 1);
-// For more examples of SPI use see https://github.com/raspberrypi/pico-examples/tree/master/spi
+
+#ifdef SCREEN_IS_ST7735
+    int ST7735_EXAMPLE_1(){
+        stdio_init_all();
+
+        // ST7735 SETUP
+        screen_init_setup(INITR_BLACKTAB,SCREEN_VERTICAL,&FreeMono6pt8b);
+        QLUMetrics m_qm = {.mer=18.0,.cn0=89.0,.evm=0.28};
+        QRCodeGenerated qr_gen = {0};
+
+        generate_qr_code(&qr_gen,&SMALL_QR_CONFIG,"http://QLU/dashboard");
+        fill_with_qr_code_bottom(&qr_gen);    
+
+        while (true) {
+            m_qm.mer += 0.1; 
+            m_qm.cn0 += 0.05; 
+            m_qm.evm += 0.01; 
+            write_boxed_metrics(5,6,ST77XX_BLUE,&m_qm);
+            sleep_ms(500);
+        }
+    }
+#endif
+
+// END

@@ -54,7 +54,7 @@
     } demod_t;
 
     // type := (symbol,sample) part := (signal,error)
-    #define GET_AVG_POWER(demod,type,part) ((demod)->sum_ ## type ## _ ## part ## _power / (demod)->sample_count)
+    #define GET_AVG_POWER(demod,type,part) ((demod)->sum_ ## type ## _ ## part ## _power / (demod)->type ## _count)
 
     const int get_bits_per_symbol[] ={
         [MOD_BPSK]  = 1,
