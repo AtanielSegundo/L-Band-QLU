@@ -18,7 +18,7 @@ struct SimulationConfig {
 QueueHandle_t configQueue;
 spi_device_handle_t spi_handle;
 
-Modulations global_mod = BPSK;
+Modulations global_mod = QAM16;
 int global_snr = 1;
 
 void commandTask(void *pvParameters);
@@ -181,62 +181,98 @@ bool parseCommand(String cmd) {
 void transmissionTask(void *pvParameters) {
     const stream_data_t* tx_ptr = nullptr;
     const stream_meta_t* meta_ptr = nullptr;
-    size_t data_len_bytes = 0;
     
-    tx_ptr = GET_DATA(BPSK, available_snr[0]);
-    meta_ptr = GET_META(BPSK, available_snr[0]);
+    tx_ptr = GET_DATA(QAM16, available_snr[0]);  // Start with QAM16
+    meta_ptr = GET_META(QAM16, available_snr[0]);
     
-    size_t chunk_size_samples = 256;
-    size_t payload_size = chunk_size_samples * sizeof(stream_data_t); // 256 * 4 bytes
-    size_t total_size = sizeof(SYNC_HEADER) + payload_size;
+    // Packet contains 256 I/Q pairs
+    const size_t IQ_PAIRS_PER_PACKET = 256;
+    const size_t ARRAY_ELEMENTS_PER_PACKET = IQ_PAIRS_PER_PACKET * 2; // 512 (interleaved I,Q)
+    const size_t PAYLOAD_BYTES = IQ_PAIRS_PER_PACKET * 4; // 1024 bytes
+    const size_t TOTAL_PACKET_SIZE = sizeof(SYNC_HEADER) + PAYLOAD_BYTES; // 1028 bytes
 
     SimulationConfig rxConfig;
     spi_transaction_t t;
 
-    uint8_t *tx_buffer = (uint8_t*) heap_caps_malloc(total_size, MALLOC_CAP_DMA);
+    uint8_t *tx_buffer = (uint8_t*) heap_caps_malloc(TOTAL_PACKET_SIZE, MALLOC_CAP_DMA);
+    if (tx_buffer == NULL) {
+        Serial.println("[ERROR] Failed to allocate DMA buffer!");
+        vTaskDelete(NULL);
+        return;
+    }
+    
+    // Copy sync header once (never changes)
     memcpy(tx_buffer, SYNC_HEADER, sizeof(SYNC_HEADER));
 
-    Serial.println("[Core 1] Transmission Task Started with Precise Timing");
+    // Track position in source array
+    size_t source_offset = 0;
+
+    Serial.println("[Core 1] Waiting 3s for Pico...");
+    vTaskDelay(pdMS_TO_TICKS(3000));
+    Serial.println("[Core 1] Starting transmission...");
+    
+    // DEBUG: Print first packet contents
+    Serial.println("[TX DEBUG] First packet will contain:");
+    for (int i = 0; i < 6; i++) {
+        Serial.printf("  Array[%d] = %u (0x%04X)\n", i, tx_ptr[i], tx_ptr[i]);
+    }
 
     while (true) {
+        // Check for config changes
         if (xQueueReceive(configQueue, &rxConfig, 0) == pdTRUE) {
             tx_ptr = GET_DATA(rxConfig.modulation, rxConfig.snr);
-            meta_ptr = GET_META(rxConfig.modulation, rxConfig.snr);  
+            meta_ptr = GET_META(rxConfig.modulation, rxConfig.snr);
+            source_offset = 0; // Reset position
+            Serial.printf("[Core 1] Config changed: %s, SNR %d dB\n", 
+                         GET_MODULATION_NAME(rxConfig.modulation), rxConfig.snr);
         }
 
         if (tx_ptr != nullptr && meta_ptr != nullptr) {
             memset(&t, 0, sizeof(t));
-            uint32_t num_pairs = meta_ptr->n_samples / 2;
-            uint64_t target_duration_us = ((uint64_t)num_pairs * 1000000ULL) / meta_ptr->sampling_rate;
             
-            // Se o sample rate for muito alto (ex: 20MHz), a duração alvo pode ser 0 ou muito baixa.
-            // Nesse caso, roda-se no máximo que o SPI aguentar.
-            memcpy(tx_buffer + 4, tx_ptr, payload_size);
+            // Calculate timing for this packet
+            uint64_t target_duration_us = ((uint64_t)IQ_PAIRS_PER_PACKET * 1000000ULL) / 
+                                          (meta_ptr->sampling_rate / 2); // sampling_rate is for I+Q combined
 
-            data_len_bytes = meta_ptr->n_samples * sizeof(stream_data_t);
-            t.length = total_size * 8;
+            // Fill packet payload with BIG ENDIAN data
+            size_t dest_offset = sizeof(SYNC_HEADER);
+            size_t total_samples = meta_ptr->n_samples;
+            
+            for (size_t i = 0; i < ARRAY_ELEMENTS_PER_PACKET; i++) {
+                // Get next sample from source array (with wraparound)
+                size_t src_idx = (source_offset + i) % total_samples;
+                uint16_t sample = tx_ptr[src_idx];
+                
+                // Write in BIG ENDIAN format (MSB first, LSB second)
+                tx_buffer[dest_offset++] = (uint8_t)((sample >> 8) & 0xFF); // MSB
+                tx_buffer[dest_offset++] = (uint8_t)(sample & 0xFF);        // LSB
+            }
+            
+            // Advance source offset for next packet
+            source_offset = (source_offset + ARRAY_ELEMENTS_PER_PACKET) % total_samples;
+
+            // Transmit via SPI
+            t.length = TOTAL_PACKET_SIZE * 8; // Length in bits
             t.tx_buffer = tx_buffer;
-            t.rx_buffer = NULL; // Garante que não queremos receber nada
-            t.rxlength = 0;     // Garante que o tamanho esperado de RX é 0
+            t.rx_buffer = NULL;
 
-            int64_t start_time = esp_timer_get_time(); // Tempo em microsegundos desde o boot
-            
-            spi_device_transmit(spi_handle, &t);
-            
+            int64_t start_time = esp_timer_get_time();
+            esp_err_t ret = spi_device_transmit(spi_handle, &t);
             int64_t end_time = esp_timer_get_time();
-            int64_t elapsed_us = end_time - start_time;
-
-            // === COMPENSAÇÃO DE TEMPO (DELAY) ===
-            // Se transmitimos mais rápido do que o sample rate exige, esperamos a diferença.
-            // Se o SPI (40MHz) for mais lento que o sample rate exigido, não esperamos nada (máximo esforço).
             
+            if (ret != ESP_OK) {
+                Serial.printf("[ERROR] SPI transmit failed: %d\n", ret);
+            }
+            
+            // Maintain timing
+            int64_t elapsed_us = end_time - start_time;
             if (elapsed_us < target_duration_us) {
-                // ets_delay_us é um "busy wait" preciso, ideal para microsegundos
                 ets_delay_us(target_duration_us - elapsed_us);
             }
 
         } else {
-            vTaskDelay(1);
+            Serial.println("[WARNING] No data source configured!");
+            vTaskDelay(pdMS_TO_TICKS(100));
         }
     }
 }
@@ -267,7 +303,7 @@ void initSPI() {
         .command_bits = 0,
         .address_bits = 0,
         .dummy_bits = 0,
-        .mode = 0,                  // SPI Modo 0
+        .mode = 3,                  // SPI Modo 0
         .duty_cycle_pos = 128,      // 50% duty cycle
         .cs_ena_pretrans = 0,
         .cs_ena_posttrans = 0,

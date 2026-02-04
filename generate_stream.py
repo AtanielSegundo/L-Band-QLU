@@ -137,7 +137,7 @@ def main():
 
     print("[INFO] Starting I/Q Stream Generation For SDR SIMULATOR")
 
-    snr_generation_range = list(range(1,30+1,2))
+    snr_generation_range = list(range(5,40+1,1))
     folder_path = "sdr_simulator/headers"
     if os.path.exists(folder_path): shutil.rmtree(folder_path)
     os.makedirs(folder_path,exist_ok=True)

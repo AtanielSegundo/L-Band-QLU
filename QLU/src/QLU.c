@@ -90,9 +90,19 @@
 
 
 void setup_spi_dma() {
-    // 1. Configura SPI Slave
+
+    spi_deinit(SPI_PORT);
+
     spi_init(SPI_PORT, 4 * 1000 * 1000);
-    spi_set_format(SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    
+    spi_set_format(
+            SPI_PORT,
+            8,           // 8 bits por transferência
+            SPI_CPOL_1,  // Clock polarity 0
+            SPI_CPHA_1,  // Clock phase 0
+            SPI_MSB_FIRST // MSB primeiro
+        );
+        
     spi_set_slave(SPI_PORT, true);
     
     gpio_set_function(PIN_RX, GPIO_FUNC_SPI);
@@ -125,6 +135,9 @@ void setup_spi_dma() {
         0xFFFFFFFF,            // Número de transferências (infinito/max)
         true                   // Iniciar imediatamente
     );
+
+    printf("[INFO] DMA canal %d configurado e iniciado\n", dma_chan);
+    printf("[INFO] Ring buffer: 4096 bytes em 0x%08X\n", (uint32_t)rx_ring_buffer);
 }
 
 void peripherals_setup(void){
@@ -177,7 +190,7 @@ void demod_init(demod_t *demod,demod_config_t cfg) {
 // Defina o fator de suavização (0.0 a 1.0)
 // 0.05 = Resposta lenta, muito estável (bom para números que pulam muito)
 // 0.20 = Resposta rápida, menos estável
-#define EMA_ALPHA 0.1 
+#define EMA_ALPHA 0.2
 
 void UpdateScreenTask(void* params){
     QLUMetrics m_qm = {0};
@@ -241,7 +254,7 @@ void UpdateScreenTask(void* params){
     double avg_smp_err       = 0.0;
 
     uint32_t blocks_since_reset = 0;
-    const uint32_t RESET_EVERY_N_BLOCKS = 2;
+    const uint32_t RESET_EVERY_N_BLOCKS = 5;
 
     while (true)
     {
@@ -351,62 +364,6 @@ void UpdateScreenTask(void* params){
     }
 }
 
-void SPIStreamTask(void* params){
-    static uint32_t tail_index = 0;
-    IqBlock_t txBlock;
-    static bool print_once = true;  // ADICIONAR
-
-    printf("[Core 0] Acquisition Task Iniciada\n");
-
-    while(true) {
-        uint32_t current_write_addr = (uint32_t)dma_hw->ch[dma_chan].write_addr;
-        uint32_t head_index = current_write_addr - (uint32_t)rx_ring_buffer;
-
-        uint32_t available_bytes;
-        if (head_index >= tail_index) {
-            available_bytes = head_index - tail_index;
-        } else {
-            available_bytes = (DMA_BUFFER_SIZE - tail_index) + head_index;
-        }
-
-        size_t bytes_needed = PROCESS_BLOCK_SIZE * 4;
-        
-        if (available_bytes >= bytes_needed) {
-            
-            for (int i = 0; i < PROCESS_BLOCK_SIZE; i++) {
-                
-                uint8_t b0 = rx_ring_buffer[(tail_index + 0) % DMA_BUFFER_SIZE];
-                uint8_t b1 = rx_ring_buffer[(tail_index + 1) % DMA_BUFFER_SIZE];
-                uint8_t b2 = rx_ring_buffer[(tail_index + 2) % DMA_BUFFER_SIZE];
-                uint8_t b3 = rx_ring_buffer[(tail_index + 3) % DMA_BUFFER_SIZE];
-
-                txBlock.i_samples[i] = (uint16_t)((b1 << 8) | b0);
-                txBlock.q_samples[i] = (uint16_t)((b3 << 8) | b2);
-                
-                
-                // DIAGNÓSTICO - imprimir primeira amostra de cada bloco
-                if (i == 0 && print_once) {
-                    printf("[SPI Debug] Bytes: %02X %02X %02X %02X -> I=%u Q=%u\n",
-                           b0, b1, b2, b3, 
-                           txBlock.i_samples[i], txBlock.q_samples[i]);
-                }
-                
-                tail_index = (tail_index + 4) % DMA_BUFFER_SIZE;
-            }
-            
-            print_once = false;  // Printar apenas primeiro bloco
-            
-            if (xQueueSend(xDspQueue, &txBlock, 0) != pdTRUE) {
-                // printf("Drop!\n"); 
-            }
-
-        } else {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-    }
-}
-
-
 void SPISyncedStreamTask(void* params){
     static uint32_t tail_index = 0;
     static SyncState current_state = STATE_SYNC_0;
@@ -469,8 +426,8 @@ void SPISyncedStreamTask(void* params){
                             uint8_t b3 = temp_payload_buffer[i*4 + 3];
 
                             // Reconstrói int16
-                            txBlock.i_samples[i] = (uint16_t)((b1 << 8) | b0);
-                            txBlock.q_samples[i] = (uint16_t)((b3 << 8) | b2);
+                            txBlock.i_samples[i] = (uint16_t)((b0 << 8) | b1);
+                            txBlock.q_samples[i] = (uint16_t)((b2 << 8) | b3);
                         }
 
                         // Envia para a fila de DSP
@@ -478,6 +435,179 @@ void SPISyncedStreamTask(void* params){
 
                         // Volta a procurar o próximo header
                         current_state = STATE_SYNC_0;
+                    }
+                    break;
+            }
+        }
+    }
+}
+
+void SPISyncedStreamTask_DEBUG(void* params){
+    static uint32_t tail_index = 0;
+    static SyncState current_state = STATE_SYNC_0;
+    static uint16_t payload_idx = 0;
+    static uint8_t temp_payload_buffer[PAYLOAD_SIZE];
+    
+    IqBlock_t txBlock;
+
+    printf("[Core 1] DEBUG: Iniciando Sincronizacao de Frame...\n");
+    
+    // ═══════════════════════════════════════════════════════════
+    // VARIÁVEIS DE DEBUG
+    // ═══════════════════════════════════════════════════════════
+    uint32_t bytes_received_total = 0;
+    uint32_t last_print_time = 0;
+    uint32_t sync_attempts = 0;
+    uint8_t last_10_bytes[10] = {0};
+    uint8_t last_byte_idx = 0;
+    bool first_byte_received = false;
+    // ═══════════════════════════════════════════════════════════
+
+    while(true) {
+        uint32_t current_write_addr = (uint32_t)dma_hw->ch[dma_chan].write_addr;
+        uint32_t head_index = current_write_addr - (uint32_t)rx_ring_buffer;
+        
+        // ═══════════════════════════════════════════════════════════
+        // DEBUG: Print do estado do DMA a cada segundo
+        // ═══════════════════════════════════════════════════════════
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_print_time >= 1000) {
+            printf("[DEBUG] DMA Status:\n");
+            printf("  Write addr: 0x%08X\n", current_write_addr);
+            printf("  Head index: %u\n", head_index);
+            printf("  Tail index: %u\n", tail_index);
+            printf("  Bytes received (total): %u\n", bytes_received_total);
+            printf("  Current state: %d\n", current_state);
+            printf("  Sync attempts: %u\n", sync_attempts);
+            
+            if (bytes_received_total > 0) {
+                printf("  Last 10 bytes: ");
+                for(int i=0; i<10; i++) {
+                    printf("%02X ", last_10_bytes[i]);
+                }
+                printf("\n");
+            } else {
+                printf("  ⚠️  NO BYTES RECEIVED YET!\n");
+                printf("  Check:\n");
+                printf("    - SPI connections (MOSI, CLK, CS, GND)\n");
+                printf("    - ESP32 is transmitting\n");
+                printf("    - DMA is configured correctly\n");
+            }
+            printf("\n");
+            last_print_time = now;
+        }
+        // ═══════════════════════════════════════════════════════════
+        
+        if (head_index == tail_index) {
+            vTaskDelay(pdMS_TO_TICKS(10)); // Aumentado para 10ms no debug
+            continue;
+        }
+
+        // Processa byte a byte do Ring Buffer
+        while(tail_index != head_index) {
+            uint8_t byte = rx_ring_buffer[tail_index];
+            tail_index = (tail_index + 1) % DMA_BUFFER_SIZE;
+            
+            // ═══════════════════════════════════════════════════════════
+            // DEBUG: Primeiro byte recebido
+            // ═══════════════════════════════════════════════════════════
+            if (!first_byte_received) {
+                printf("[DEBUG] ✓ FIRST BYTE RECEIVED: 0x%02X\n", byte);
+                printf("  SPI is working! Data is arriving.\n\n");
+                first_byte_received = true;
+            }
+            // ═══════════════════════════════════════════════════════════
+            
+            bytes_received_total++;
+            
+            // Guarda últimos 10 bytes para debug
+            last_10_bytes[last_byte_idx] = byte;
+            last_byte_idx = (last_byte_idx + 1) % 10;
+
+            switch (current_state) {
+                case STATE_SYNC_0:
+                    if (byte == SYNC_BYTE_0) {
+                        current_state = STATE_SYNC_1;
+                        sync_attempts++;
+                        // DEBUG: Possível início de sync
+                        printf("[DEBUG] Sync attempt #%u: Found 0x%02X\n", 
+                               sync_attempts, byte);
+                    }
+                    break;
+                    
+                case STATE_SYNC_1:
+                    if (byte == SYNC_BYTE_1) {
+                        current_state = STATE_SYNC_2;
+                        printf("[DEBUG]   → Found 0x%02X (2/4)\n", byte);
+                    } else {
+                        printf("[DEBUG]   ✗ Expected 0x%02X, got 0x%02X\n", 
+                               SYNC_BYTE_1, byte);
+                        current_state = STATE_SYNC_0;
+                    }
+                    break;
+                    
+                case STATE_SYNC_2:
+                    if (byte == SYNC_BYTE_2) {
+                        current_state = STATE_SYNC_3;
+                        printf("[DEBUG]   → Found 0x%02X (3/4)\n", byte);
+                    } else {
+                        printf("[DEBUG]   ✗ Expected 0x%02X, got 0x%02X\n", 
+                               SYNC_BYTE_2, byte);
+                        current_state = STATE_SYNC_0;
+                    }
+                    break;
+                    
+                case STATE_SYNC_3:
+                    if (byte == SYNC_BYTE_3) {
+                        current_state = STATE_PAYLOAD;
+                        payload_idx = 0;
+                        printf("[DEBUG]   → Found 0x%02X (4/4) ✓ SYNC LOCKED!\n", byte);
+                        printf("[DEBUG]   → Starting payload reception...\n");
+                    } else {
+                        printf("[DEBUG]   ✗ Expected 0x%02X, got 0x%02X\n", 
+                               SYNC_BYTE_3, byte);
+                        current_state = STATE_SYNC_0;
+                    }
+                    break;
+
+                case STATE_PAYLOAD:
+                    temp_payload_buffer[payload_idx++] = byte;
+
+                    if (payload_idx >= PAYLOAD_SIZE) {
+                        printf("[DEBUG] ✓ FULL PACKET RECEIVED! Processing...\n");
+                        
+                        // Processa payload
+                        for (int i = 0; i < 256; i++) {
+                            uint8_t b0 = temp_payload_buffer[i*4 + 0];
+                            uint8_t b1 = temp_payload_buffer[i*4 + 1];
+                            uint8_t b2 = temp_payload_buffer[i*4 + 2];
+                            uint8_t b3 = temp_payload_buffer[i*4 + 3];
+
+                            txBlock.i_samples[i] = (uint16_t)((b0 << 8) | b1);
+                            txBlock.q_samples[i] = (uint16_t)((b2 << 8) | b3);
+                        }
+                        
+                        // Debug: Print primeiras amostras
+                        printf("[DEBUG] First 3 I/Q pairs:\n");
+                        for(int i=0; i<3; i++) {
+                            printf("  [%d] I=%u Q=%u\n", 
+                                   i, txBlock.i_samples[i], txBlock.q_samples[i]);
+                        }
+
+                        // Envia para fila
+                        if (xQueueSend(xDspQueue, &txBlock, 0) == pdTRUE) {
+                            printf("[DEBUG] ✓ Packet sent to DSP queue!\n\n");
+                        } else {
+                            printf("[DEBUG] ✗ DSP queue full, packet dropped!\n\n");
+                        }
+
+                        current_state = STATE_SYNC_0;
+                    } else {
+                        // Print progresso a cada 256 bytes
+                        if ((payload_idx % 256) == 0) {
+                            printf("[DEBUG]   Payload progress: %u/%u bytes\n", 
+                                   payload_idx, PAYLOAD_SIZE);
+                        }
                     }
                     break;
             }
