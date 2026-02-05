@@ -2,7 +2,6 @@
 
     #include <stdio.h>
     #include "pico/stdlib.h"
-    #include "pico/cyw43_arch.h"
     #include "hardware/spi.h"
     #include "hardware/dma.h"
 
@@ -34,7 +33,7 @@
 
 // END
 
-// QLU GLOBAL DEFINITIONS
+// QLU CONST DEFINITIONS
 
     #define SPI_PORT_FREQUENCY (1 * 1000 * 1000)
     #define SPI_PORT spi0
@@ -46,23 +45,12 @@
     // --- Configurações de Buffer ---
     #define DMA_BUFFER_SIZE 4096 
     uint8_t __attribute__((aligned(DMA_BUFFER_SIZE))) rx_ring_buffer[DMA_BUFFER_SIZE];
+
+    QueueHandle_t xDspQueue;
     int dma_chan;
 
-    #define DSP_QUEUE_LENGHT 1
-    
-    QueueHandle_t xDspQueue;
-    QueueHandle_t xToScreenMetrics;
-    QueueHandle_t xToWebMetrics;
-
-    #define WEB_REF_SAMPLES_CNT (15U)
-
-    typedef struct {
-        QLUMetrics m;
-        double f_I[WEB_REF_SAMPLES_CNT];
-        double f_Q[WEB_REF_SAMPLES_CNT];
-    } WebMetrics;
-
 // END
+
 
 // QLU TEST DEFINITIONS
 
@@ -98,95 +86,6 @@
         STATE_SYNC_3, // Procurando 0xCA
         STATE_PAYLOAD // Lendo dados
     } SyncState;
-
-// END
-
-
-// SERVER RELATED DEFINITIONS
-
-    #include "http.h"
-    #include "websocket.h"
-
-    #include "routes/index.h"
-    #include "routes/ws_only.h"
-
-    SemaphoreHandle_t lwip_mutex = NULL;
-    
-    static ip4_addr_t cyw43_ip = {0};
-    
-    typedef struct {char* ssid; char* password} WifiNetwork;
-    
-    #define ACCESS_POINT_MODE
-
-    #ifdef ACCESS_POINT_MODE
-
-        #include "ap.h"
-        #include "pico/unique_id.h"
-
-        #define AP_SSID "QLU"
-        #define AP_PWD "vsatqlu123"
-        #define SITE_NAME "qlu.local"
-        
-        void setup_cyw43_network(void){
-            pico_unique_board_id_t board_id;
-            pico_get_unique_board_id(&board_id);
-
-            char temp[64];
-
-            sprintf(temp, "%s_%02X%02X%02X%02X%02X%02X%02X%02X",
-                    AP_SSID,
-                    board_id.id[0], board_id.id[1], board_id.id[2],
-                    board_id.id[3], board_id.id[4], board_id.id[5],
-                    board_id.id[6], board_id.id[7]
-            );
-
-            setup_access_point(temp, AP_PWD, SITE_NAME);
-        }
-    
-    #else 
-        #define CONNECTION_MAX_TRIES (3U)
-        
-        const WifiNetwork NETWORKS_TO_CONNECT[] ={
-            (WifiNetwork){"F_Santos_2_4","Asss060325"},
-            (WifiNetwork){"mi_local","senha123"},
-        };
-        const size_t NETWORK_TO_CONNECT_COUNT = count_of(NETWORKS_TO_CONNECT);
-
-        void setup_cyw43_network(void){
-            cyw43_arch_init();
-            cyw43_arch_enable_sta_mode();
-            bool connected = false;
-            for(size_t i=0; i < NETWORKS_TO_CONNECT; i++){
-                for(int tries = 0; tries < CONNECTION_MAX_TRIES; tries++){
-                     if (cyw43_arch_wifi_connect_timeout_ms(
-                        NETWORKS_TO_CONNECT[i].ssid,
-                        NETWORKS_TO_CONNECT[i].password, 
-                        CYW43_AUTH_WPA2_AES_PSK,
-                        30000) != 0){
-                            printf("[INFO] Tentando Reconectar a %s: tentativa %d\n",NETWORKS_TO_CONNECT[i].ssid,(tries+1));
-                            sleep_ms(500);
-                        }
-                    else {
-                        connected = true;
-                        break;
-                    }
-                }
-                if (connected){
-                    printf("[INFO] Conectado a %s\n",NETWORKS_TO_CONNECT[i].ssid);
-                    break;
-                }
-            };
-
-            if (connected){
-                struct netif *sta_if = &cyw43_state.netif[CYW43_ITF_STA];
-                while (ip4_addr_isany_val(*netif_ip4_addr(sta_if))) {
-                    sleep_ms(100);
-                }
-                cyw43_ip = *netif_ip4_addr(sta_if);
-            }
-        }
-
-    #endif
 
 // END
 
@@ -255,10 +154,36 @@ void peripherals_setup(void){
     #endif
     
     setup_spi_dma();
+}
 
-    setup_cyw43_network();
 
-    printf("[INFO] Device IP: %s\n", ip4addr_ntoa(&cyw43_ip));
+// static inline int32_t uint16_to_signed(uint16_t raw, uint8_t resolution) {
+//     // // Correção: half deve ser 2^(resolution-1), não (2^resolution - 1) / 2
+//     // uint32_t half = (1u << (resolution - 1));  // Para 16 bits: 32768 (não 32767!)
+//     // int32_t tmp = (int32_t)raw - (int32_t)half;
+    
+//     uint32_t max_uint = ((1u << resolution) - 1u);
+//     uint32_t half = max_uint / 2u;
+//     int32_t tmp = (int32_t)raw - (int32_t)half;
+
+//     if (tmp < -32768) tmp = -32768;
+//     if (tmp >  32767) tmp =  32767;
+    
+//     return tmp;
+// }
+
+
+void demod_init(demod_t *demod,demod_config_t cfg) {
+    demod->config                  = cfg;
+    demod->scale                   = config_get_scale_factor(&demod->config);
+    demod->stream_idx              = 0;
+    demod->sym                     = (symbol_acc_t){0, 0, 0};
+    demod->sum_symbol_signal_power = 0.0;
+    demod->sum_symbol_error_power  = 0.0;
+    demod->symbol_count            = 0;
+    demod->sum_sample_signal_power = 0.0;
+    demod->sum_sample_error_power  = 0.0;
+    demod->sample_count            = 0;
 }
 
 // PROJECT TASKS 
@@ -266,15 +191,28 @@ void peripherals_setup(void){
 // Defina o fator de suavização (0.0 a 1.0)
 // 0.05 = Resposta lenta, muito estável (bom para números que pulam muito)
 // 0.20 = Resposta rápida, menos estável
-#define EMA_ALPHA 0.1
+#define EMA_ALPHA 0.2
 
-void StreamProcessToMetricsTask(void* params){
-    static IqBlock_t  rxBlock;
-    static QLUMetrics local_qlu_metrics = {0};
-    static WebMetrics local_web_metrics = {0};
+void UpdateScreenTask(void* params){
+    QLUMetrics m_qm = {0};
     
+    // Variáveis estáticas para manter o valor entre iterações
+    static double smooth_snr = 0.0;
+    static double smooth_mer = 0.0;
+    static double smooth_evm = 0.0;
+    static double smooth_cn0 = 0.0;
+    static bool first_run = true;
+
+    #ifdef SCREEN_IS_ST7735
+        QRCodeGenerated qr_gen = {0};
+        generate_qr_code(&qr_gen,&SMALL_QR_CONFIG,"http://QLU/dashboard.local");
+        fill_with_qr_code_bottom(&qr_gen);
+    #endif 
+
+    IqBlock_t rxBlock;
     demod_t demod;
 
+    // Configuração (Mantenha a sua configuração atual)
     demod_config_t cfg = {
         .link_bw_hz = 10e6,
         .sampling_rate_hz = 20e6,
@@ -285,21 +223,16 @@ void StreamProcessToMetricsTask(void* params){
     config_calculate_derived(&cfg);
     demod_init(&demod,cfg);
 
-    double smooth_snr = 0.0;
-    double smooth_mer = 0.0;
-    double smooth_evm = 0.0;
-    double smooth_cn0 = 0.0;
-    
-    bool first_run = true;
     uint32_t sps_ceil = (uint32_t)ceil(demod.config.samples_per_symbol);
-    uint32_t blocks_since_reset = 0;
-    const uint32_t RESET_EVERY_N_BLOCKS = 5;
 
+    // Variáveis temporárias (Instantâneas)
     double inst_mer = 0.0;
     double inst_snr = 0.0;
     double inst_evm = 0.0;
     double inst_cn0 = 0.0;
 
+    // ... (Variáveis auxiliares de loop: raw_i, fi, result, etc mantidas iguais) ...
+    // NEEDED VARIABLES FOR CALCULATIONS (Copie as do seu código anterior)
     float        signal_power      = 0.0f;
     uint16_t     raw_i             = 0u;
     uint16_t     raw_q             = 0u;
@@ -315,35 +248,38 @@ void StreamProcessToMetricsTask(void* params){
     double       ideal_power       = 0.0;
     double       error_power       = 0.0;
 
+    // Variáveis de cálculo de média
     double avg_sym_sig_power = 0.0;
     double avg_sym_err_power = 0.0;
     double avg_smp_sig       = 0.0;
     double avg_smp_err       = 0.0;
 
+    uint32_t blocks_since_reset = 0;
+    const uint32_t RESET_EVERY_N_BLOCKS = 5;
+
     while (true)
     {
-        // FIXED: Single while with data processing AND queue sending
-        if (xQueueReceive(xDspQueue, &rxBlock, 0) == pdPASS) {
+        if (xQueueReceive(xDspQueue, &rxBlock, portMAX_DELAY) == pdPASS) {
             
-            // 1. Process the block
-            for(int k=0; k<PROCESS_BLOCK_SIZE; k++) {    
+            // 1. Processa o bloco (Acumula estatísticas instantâneas)
+            for(int k=0; k<PROCESS_BLOCK_SIZE; k++) {
+                // ... (CÓDIGO DO LOOP FOR IDÊNTICO AO ANTERIOR) ...
+                // Copie a lógica de conversão, slicer e demod.sum_... += ...
+                
                 raw_i = rxBlock.i_samples[k];
                 raw_q = rxBlock.q_samples[k];
                 halfed_i = uint16_to_signed(raw_i,demod.config.signal_resolution);
                 halfed_q = uint16_to_signed(raw_q,demod.config.signal_resolution);
                 fi = (double)halfed_i / demod.scale;
                 fq = (double)halfed_q / demod.scale;                
-                
-                if( k % WEB_REF_SAMPLES_CNT == 0 ){
-                    local_web_metrics.f_I[(k / WEB_REF_SAMPLES_CNT) % WEB_REF_SAMPLES_CNT] = fi;
-                    local_web_metrics.f_Q[(k / WEB_REF_SAMPLES_CNT) % WEB_REF_SAMPLES_CNT] = fq;
-                }
 
+                // Sample level (Pre-SNR)
                 result = get_slicer_by_mod[demod.config.modulation](fi,fq);
                 demod.sum_sample_signal_power += slicer_calculate_power(result.ideal_i,result.ideal_q);
                 demod.sum_sample_error_power  += slicer_calculate_power(fi - result.ideal_i, fq - result.ideal_q);
                 demod.sample_count++;
 
+                // Symbol level (Post-SNR / MER)
                 demod.sym.acc_i += fi;
                 demod.sym.acc_q += fq;
                 demod.sym.count++;
@@ -363,7 +299,8 @@ void StreamProcessToMetricsTask(void* params){
                 }   
             }
 
-            // 2. Calculate instantaneous metrics
+            // 2. Calcula métricas INSTANTÂNEAS (deste bloco apenas)
+            // -----------------------------------------------------------
             avg_sym_sig_power = (demod.symbol_count > 0) ? (demod.sum_symbol_signal_power / demod.symbol_count) : 0.0;
             avg_sym_err_power = (demod.symbol_count > 0) ? (demod.sum_symbol_error_power / demod.symbol_count) : 0.0;
             
@@ -383,7 +320,6 @@ void StreamProcessToMetricsTask(void* params){
             } else {
                 inst_snr = 0.0;
             }
-
             inst_cn0 = inst_mer + 10.0 * log10(demod.config.symbol_rate_hz);
             
             if (first_run) {
@@ -399,17 +335,12 @@ void StreamProcessToMetricsTask(void* params){
                 smooth_cn0 = (EMA_ALPHA * inst_cn0) + ((1.0 - EMA_ALPHA) * smooth_cn0);
             }
 
-            // 3. Update metrics structure
-            local_qlu_metrics.snr = smooth_snr;
-            local_qlu_metrics.mer = smooth_mer;
-            local_qlu_metrics.evm = smooth_evm;
-            local_qlu_metrics.cn0 = smooth_cn0;
+            // 4. Prepara dados para tela usando valores suavizados
+            m_qm.snr = smooth_snr;
+            m_qm.mer = smooth_mer;
+            m_qm.evm = smooth_evm;
+            m_qm.cn0 = smooth_cn0;
 
-            local_web_metrics.m.snr = smooth_snr;
-            local_web_metrics.m.mer = smooth_mer;
-            local_web_metrics.m.evm = smooth_evm;
-            local_web_metrics.m.cn0 = smooth_cn0;
-            
             blocks_since_reset++;
             if (blocks_since_reset >= RESET_EVERY_N_BLOCKS) {
                 demod.sum_symbol_signal_power = 0.0;
@@ -420,183 +351,21 @@ void StreamProcessToMetricsTask(void* params){
                 demod.sample_count            = 0;
                 blocks_since_reset = 0;
             }
-
-            // 4. SEND TO QUEUES (NOW INSIDE THE LOOP!)
-            
-            xQueueOverwrite(xToScreenMetrics, &local_qlu_metrics);
-            xQueueOverwrite(xToWebMetrics, &local_web_metrics);
-            
-            // #if (DSP_QUEUE_LENGHT == 1)
-            //     xQueueOverwrite(xToScreenMetrics, &local_qlu_metrics);
-            //     xQueueOverwrite(xToWebMetrics, &local_qlu_metrics);
-            // #else
-            //     xQueueSend(xToScreenMetrics, &local_qlu_metrics, 0);
-            //     xQueueSend(xToWebMetrics, &local_qlu_metrics, 0);
-            // #endif
         }
-        
-        // Small delay to prevent starving other tasks
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-}
-
-void WebMetricsTojson(char* json_buffer, WebMetrics* metrics, size_t* json_lenght) {
-    // 1. Inicia o JSON com as métricas escalares
-    // Usamos um deslocamento (offset) para ir preenchendo o buffer progressivamente
-    int offset = snprintf(json_buffer, 512, 
-        "{\"snr\":%.2f,\"mer\":%.2f,\"evm\":%.2f,\"cn0\":%.2f,\"points\":[", 
-        metrics->m.snr, metrics->m.mer, metrics->m.evm, metrics->m.cn0);
-
-    // 2. Adiciona os pontos de constelação (f_I, f_Q) para o gráfico da Web
-    for (uint32_t i = 0; i < WEB_REF_SAMPLES_CNT; i++) {
-        int written = snprintf(json_buffer + offset, 512 - offset,
-            "{\"i\":%.3f,\"q\":%.3f}%s",
-            metrics->f_I[i], 
-            metrics->f_Q[i],
-            (i < WEB_REF_SAMPLES_CNT - 1) ? "," : ""); // Vírgula apenas entre elementos
-        
-        offset += written;
-        
-        // Proteção contra estouro de buffer durante a montagem do array
-        if (offset >= 510) break; 
-    }
-
-    // 3. Fecha o JSON
-    int final_bits = snprintf(json_buffer + offset, 512 - offset, "]}");
-    offset += final_bits;
-
-    // 4. Retorna o comprimento real da string gerada
-    if (json_lenght != NULL) {
-        *json_lenght = (size_t)offset;
-    }
-}
-
-void WebStreamMetricsTask(void* parameters){
-    WebMetrics local_metrics = {0};
-    static char ws_stream_json[512];
-    size_t ws_stream_lenght = 0;
-
-    for(;;){
-        xQueueReceive(xToWebMetrics,&local_metrics,0);
-        WebMetricsTojson(ws_stream_json,&local_metrics,&ws_stream_lenght);
-        if (xSemaphoreTake(lwip_mutex, portMAX_DELAY)){
-            ws_send_to_all_clients("/ws/stream",WS_OP_TEXT,ws_stream_json,ws_stream_lenght);
-            xSemaphoreGive(lwip_mutex);
-        }
-        vTaskDelay(pdMS_TO_TICKS(350));
-    }   
-};
-
-
-void WebConfigProcessTask(void* parameters){
-    // PASS
-};
-
-void UpdateScreenTask(void* params){
-    QLUMetrics local_metrics = {0};
-    
-    while (true)
-    {
-        xQueueReceive(xToScreenMetrics,&local_metrics,portMAX_DELAY);
 
         #ifdef SCREEN_IS_ST7735
             write_boxed_metrics(5,6,ST77XX_BLUE,&m_qm);
         #endif
 
         #ifdef SCREEN_IS_SSD1306
-            write_boxed_metrics(5,6,8,&local_metrics);
+            write_boxed_metrics(5,6,8,&m_qm);
         #endif
-    
-        vTaskDelay(pdMS_TO_TICKS(250));    
-    }
-    
-}
-
-void Iq_from_payload_block(uint8_t* payload_buf, IqBlock_t* iq_buf, size_t block_size){
-    for (size_t i = 0; i < block_size; i++) {
-        // ATENÇÃO: Endianness corrigido aqui (Little Endian)
-        // Buffer bruto: [LSB_I, MSB_I, LSB_Q, MSB_Q]
-        uint8_t b0 = payload_buf[i*4 + 0];
-        uint8_t b1 = payload_buf[i*4 + 1];
-        uint8_t b2 = payload_buf[i*4 + 2];
-        uint8_t b3 = payload_buf[i*4 + 3];
-
-        // Reconstrói int16
-        iq_buf->i_samples[i] = (uint16_t)((b0 << 8) | b1);
-        iq_buf->q_samples[i] = (uint16_t)((b2 << 8) | b3);
+        
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
 void SPISyncedStreamTask(void* params){
-    static uint32_t tail_index     = 0;
-    static SyncState current_state = STATE_SYNC_0;
-    static uint16_t payload_idx    = 0;
-    static uint8_t temp_payload_buffer[PAYLOAD_SIZE];
-    
-    IqBlock_t txBlock;
-
-    printf("[Core 1] Iniciando Sincronizacao de Frame...\n");
-
-    while (true)
-    {
-        uint32_t current_write_addr = (uint32_t)dma_hw->ch[dma_chan].write_addr;
-        uint32_t head_index = current_write_addr - (uint32_t)rx_ring_buffer;
-        
-        if (head_index == tail_index) {
-            vTaskDelay(1); 
-            continue;
-        }
-
-        while(tail_index != head_index) {
-            uint8_t byte = rx_ring_buffer[tail_index];
-            tail_index = (tail_index + 1) % DMA_BUFFER_SIZE;
-
-            // PROPER STATE MACHINE (like DEBUG version)
-            switch (current_state) {
-                case STATE_SYNC_0:
-                    if (byte == SYNC_BYTE_0) current_state = STATE_SYNC_1;
-                    break;
-                    
-                case STATE_SYNC_1:
-                    if (byte == SYNC_BYTE_1) current_state = STATE_SYNC_2;
-                    else current_state = STATE_SYNC_0;
-                    break;
-                    
-                case STATE_SYNC_2:
-                    if (byte == SYNC_BYTE_2) current_state = STATE_SYNC_3;
-                    else current_state = STATE_SYNC_0;
-                    break;
-                    
-                case STATE_SYNC_3:
-                    if (byte == SYNC_BYTE_3) {
-                        current_state = STATE_PAYLOAD;
-                        payload_idx = 0; // CRITICAL: Reset here!
-                    } else {
-                        current_state = STATE_SYNC_0;
-                    }
-                    break;
-
-                case STATE_PAYLOAD:
-                    temp_payload_buffer[payload_idx++] = byte;
-
-                    if (payload_idx >= PAYLOAD_SIZE) {
-                        Iq_from_payload_block(temp_payload_buffer, &txBlock, PROCESS_BLOCK_SIZE);
-
-                        #if (DSP_QUEUE_LENGHT == 1)
-                            xQueueOverwrite(xDspQueue, &txBlock);
-                        #else
-                            xQueueSend(xDspQueue, &txBlock, 0);
-                        #endif
-
-                        current_state = STATE_SYNC_0;
-                    }
-                    break;
-            }
-        }
-    }
-}
-
-void SPISyncedStreamTaskOld(void* params){
     static uint32_t tail_index = 0;
     static SyncState current_state = STATE_SYNC_0;
     static uint16_t payload_idx = 0;
@@ -663,11 +432,7 @@ void SPISyncedStreamTaskOld(void* params){
                         }
 
                         // Envia para a fila de DSP
-                        #if (DSP_QUEUE_LENGHT == 1)
-                            xQueueOverwrite(xDspQueue, &txBlock);
-                        #else
-                            xQueueSend(xDspQueue, &txBlock, 0);
-                        #endif
+                        xQueueSend(xDspQueue, &txBlock, 0);
 
                         // Volta a procurar o próximo header
                         current_state = STATE_SYNC_0;
@@ -675,8 +440,6 @@ void SPISyncedStreamTaskOld(void* params){
                     break;
             }
         }
-
-        vTaskDelay(1);
     }
 }
 
@@ -884,62 +647,21 @@ void SPITestStreamTask(void* params){
 
 #endif
 
-void create_index_response(char* query_params ,char* buffer, size_t len) {
-    snprintf(buffer, len, HTTP_HEADER INDEX_BODY);   
-}
-
-void create_ws_only_response(char* query_params ,char* buffer, size_t len){
-    snprintf(buffer, len, HTTP_HEADER WS_ONLY_BODY);
-}
-
-void serverTask(void *p){
-  
-    add_http_route("/", create_index_response);
-    add_http_route("/ws/stream", create_ws_only_response);
-    add_http_route("/ws/config", create_ws_only_response);
-    
-    add_new_schema_route("websocket", websocket_schema_upgrade);
-
-    start_http_server();
-
-    xTaskCreateAffinitySet(
-        WebStreamMetricsTask,
-        "Web Stream Metrics Task",
-        1024,
-        NULL,
-        5,
-        RP2040_CORE_0,
-        NULL
-    );
-
-    for(;;){
-        if (xSemaphoreTake(lwip_mutex, portMAX_DELAY)){
-            cyw43_arch_poll();
-            xSemaphoreGive(lwip_mutex);
-        }
-        vTaskDelay(pdMS_TO_TICKS(10));
-    }
-}
-
-
 // END
 
 int main()
 {
-    printf("[INFO] SYSTEM STARTING...\n");    
-    sleep_ms(3000);
-        peripherals_setup();
+    peripherals_setup();
+    sleep_ms(2000);
+        printf("[INFO] SYSTEM STARTING...\n");    
     sleep_ms(2000);
         printf("[INFO] SYSTEM STARTED...\n");
 
-    xDspQueue        = xQueueCreate(DSP_QUEUE_LENGHT, sizeof(IqBlock_t));
-    
-    xToScreenMetrics = xQueueCreate(1, sizeof(QLUMetrics));
-    xToWebMetrics    = xQueueCreate(1, sizeof(WebMetrics));
-    lwip_mutex = xSemaphoreCreateMutex();
+    xDspQueue = xQueueCreate(10, sizeof(IqBlock_t));
 
-    // Core 1: Gerencia o buffer DMA e monta os pacotes para o processamento
+    
     #ifdef DEMOD_TEST
+         // Core 1: Gerencia o buffer DMA e monta os pacotes para o processamento
         xTaskCreateAffinitySet(
             SPITestStreamTask, 
             "SPI Test Stream Handling Task", 
@@ -950,12 +672,13 @@ int main()
             NULL
         );
     #else
+        // Core 1: Gerencia o buffer DMA e monta os pacotes para o processamento
         xTaskCreateAffinitySet(
-            SPISyncedStreamTask, 
+            SPISyncedStreamTask_DEBUG, 
             "SPI Stream Handling Task", 
             4096, 
             NULL, 
-            20,      
+            10,      
             RP2040_CORE_1,
             NULL
         );
@@ -963,34 +686,15 @@ int main()
 
     // Core 0: Gerencia o Screen e processa os dados recebidos na fila
     xTaskCreateAffinitySet(
-        StreamProcessToMetricsTask,
-        "Stream Process To Metrics",
-        4096,
-        NULL,
-        10,
-        RP2040_CORE_0,
-        NULL
-    );
-
-    xTaskCreateAffinitySet(
         UpdateScreenTask,
         "Screen Update Task",
-        1024,
+        4096,
         NULL,
         5,
         RP2040_CORE_0,
         NULL
     );
 
-    xTaskCreateAffinitySet(
-        serverTask,
-        "Server Task",
-        4096,
-        NULL,
-        10,
-        RP2040_CORE_0,
-        NULL);
-    
     vTaskStartScheduler();
 
     while (true) {
@@ -999,7 +703,10 @@ int main()
 }
 
 
+
+
 // EXAMPLES
+
 
 #ifdef SCREEN_IS_ST7735
     int ST7735_EXAMPLE_1(){

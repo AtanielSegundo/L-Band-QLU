@@ -40,6 +40,10 @@ include(${FREERTOS_KERNEL_PATH}/portable/ThirdParty/GCC/RP2040/FreeRTOS_Kernel_i
 
 add_executable(QLU 
                src/QLU.c 
+               src/http.c
+               src/ap.c
+               libs/dhcpserver/dhcpserver.c
+               libs/dnsserver/dnsserver.c
                ${FREERTOS_KERNEL_PATH}/portable/MemMang/heap_4.c
                )
 
@@ -61,6 +65,8 @@ target_link_libraries(QLU
         ${CMAKE_CURRENT_LIST_DIR}
         pico_stdlib
         FreeRTOS-Kernel
+        pico_cyw43_driver
+        pico_cyw43_arch_lwip_poll
         pico_multicore
     )
 
@@ -70,11 +76,13 @@ target_include_directories(QLU PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/includes
         ${CMAKE_CURRENT_LIST_DIR}/routes
         ${CMAKE_CURRENT_LIST_DIR}/configs
+        ${CMAKE_CURRENT_LIST_DIR}/libs/dhcpserver
+        ${CMAKE_CURRENT_LIST_DIR}/libs/dnsserver
 )
 
 add_subdirectory(libs/ST7735)
 add_subdirectory(libs/QRcode)
-# add_subdirectory(libs/picow_websockets)
+add_subdirectory(libs/picow_websockets)
 
 # Add any user requested libraries
 
@@ -82,7 +90,7 @@ target_link_libraries(QLU
         hardware_spi
         hardware_dma
         hardware_i2c
-        # picow_websockets
+        picow_websockets
         st7735
         gfx
         QRcode

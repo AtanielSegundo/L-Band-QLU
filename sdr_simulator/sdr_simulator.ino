@@ -2,6 +2,7 @@
 #include "headers/simulation_base.h"
 
 #define SPI_HOST_ID   SPI2_HOST // FSPI
+#define SPI_PORT_FREQUENCY (1 * 1000 * 1000)
 #define PIN_NUM_MISO  13
 #define PIN_NUM_MOSI  11
 #define PIN_NUM_CLK   12
@@ -307,7 +308,7 @@ void initSPI() {
         .duty_cycle_pos = 128,      // 50% duty cycle
         .cs_ena_pretrans = 0,
         .cs_ena_posttrans = 0,
-        .clock_speed_hz = 4 * 1000 * 1000, // 40 MHz (Clock Base)
+        .clock_speed_hz = SPI_PORT_FREQUENCY, // 40 MHz (Clock Base)
         .spics_io_num = PIN_NUM_CS,
         .queue_size = 1,            // Tamanho da fila de transações
         // .pre_cb = NULL,          // Callback antes da transação

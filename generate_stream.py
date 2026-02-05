@@ -72,7 +72,7 @@ def calculate_cn0(complex_iq, sampling_rate, modem):
     return cn0_dbhz
 
 def main():
-    stream_str = "Hello IQ Stream"
+    stream_str = '''t2OcohNI8LVpbG28G4mV7R8Ht34YJSyKQMbrIwerCKnJvTXKdybsJCKclGk3xNoBwlR58RslAN4pAwjJq4fTpL7aIH44wlOK63468oUbjrZhE5rOq4uAwmB40w98tRDqS35WbZdLM7bNbzCHf7r2YlT70U7KY1jv8BsQSrZwqIx873tL2'''
     byte_stream = bytearray(stream_str,encoding="ascii")
 
     link_bw  = MegaHz(83.75)
@@ -137,7 +137,7 @@ def main():
 
     print("[INFO] Starting I/Q Stream Generation For SDR SIMULATOR")
 
-    snr_generation_range = list(range(5,40+1,1))
+    snr_generation_range = list(range(1,40+1,1))
     folder_path = "sdr_simulator/headers"
     if os.path.exists(folder_path): shutil.rmtree(folder_path)
     os.makedirs(folder_path,exist_ok=True)
