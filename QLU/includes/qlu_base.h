@@ -11,7 +11,10 @@ typedef struct {
     double mer;
     double cn0;
     double evm;
-} QLUMetrics; 
+    double stability;
+    double skew_score;
+    double sqi;
+} QLUMetrics;
 
 
 #endif

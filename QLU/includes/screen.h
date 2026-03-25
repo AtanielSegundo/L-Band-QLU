@@ -202,8 +202,8 @@ o Screen TFT ST7735.
 
         uint8_t cursor_y = pad;
 
-        snprintf(buffer, sizeof(buffer), "SNR: %.2f dB", qm->snr);
-        ssd1306_draw_string((uint8_t*)ssd, 0, cursor_y, buffer);
+        // snprintf(buffer, sizeof(buffer), "SNR: %.2f dB", qm->snr);
+        // ssd1306_draw_string((uint8_t*)ssd, 0, cursor_y, buffer);
         
         cursor_y += line_height;
         snprintf(buffer, sizeof(buffer), "MER: %.2f dB", qm->mer);

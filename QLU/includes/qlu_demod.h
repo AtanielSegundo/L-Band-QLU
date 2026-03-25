@@ -17,6 +17,8 @@ typedef enum {
     MOD_BPSK, 
     MOD_QPSK, 
     MOD_16QAM,
+    
+    MOD_NUM_MODULATIONS
 } modulation_type_t;
 
 typedef struct {
@@ -80,7 +82,17 @@ const char* get_modulation_name[] = {
     [MOD_QPSK]  = "QPSK",
     [MOD_16QAM] = "16QAM"
 };
-    
+
+bool get_modulation_from_name(modulation_type_t* mod, char* name){
+    bool match = false;
+    for(size_t i=0; i < MOD_NUM_MODULATIONS; i++){
+        if(strcmp(get_modulation_name[i],name) == 0){
+            match = true;
+            *mod = (modulation_type_t)i; 
+        }
+    }
+    return match;
+}
 
 static inline void config_calculate_derived(demod_config_t *cfg) {
     cfg->bits_per_symbol = get_bits_per_symbol[cfg->modulation];
@@ -185,6 +197,72 @@ void demod_init(demod_t *demod,demod_config_t cfg) {
     demod->sum_sample_signal_power = 0.0;
     demod->sum_sample_error_power  = 0.0;
     demod->sample_count            = 0;
+}
+
+void demod_cfg_update(demod_t *demod,demod_config_t cfg){
+    demod->config                  = cfg;
+    demod->scale                   = config_get_scale_factor(&demod->config);
+}
+
+// ---------------------------------------------------------------------------
+// SQI — Signal Quality Index (ported from modulations/metrics.py)
+// ---------------------------------------------------------------------------
+
+// MER normalization per modulation (Ku-band Gemini-4 thresholds)
+//   BPSK:  floor= 5 dB, ceiling=20 dB
+//   QPSK:  floor= 8 dB, ceiling=23 dB
+//   16QAM: floor=15 dB, ceiling=32 dB
+static inline double normalize_mer(double mer_db, modulation_type_t mod) {
+    double floor_db, ceil_db;
+    switch (mod) {
+        case MOD_BPSK:  floor_db =  5.0; ceil_db = 20.0; break;
+        case MOD_QPSK:  floor_db =  8.0; ceil_db = 23.0; break;
+        case MOD_16QAM: floor_db = 15.0; ceil_db = 32.0; break;
+        default:        floor_db =  8.0; ceil_db = 25.0; break;
+    }
+    double v = (mer_db - floor_db) / (ceil_db - floor_db) * 100.0;
+    if (v < 0.0)   return 0.0;
+    if (v > 100.0)  return 100.0;
+    return v;
+}
+
+// C/N0 normalization (Ku-band VSAT: 50–80 dB-Hz)
+static inline double normalize_cn0(double cn0_dbhz) {
+    double v = (cn0_dbhz - 50.0) / (80.0 - 50.0) * 100.0;
+    if (v < 0.0)   return 0.0;
+    if (v > 100.0)  return 100.0;
+    return v;
+}
+
+// Skew score from IQ imbalance (ported from skew.py:skew_score)
+//   Phase:     0° → 100,  >=15° → 0
+//   Amplitude: 0dB → 100, >=3dB → 0
+static inline double calculate_skew_score(double amp_imb_db, double phase_imb_deg) {
+    const double PHASE_MAX = 15.0;
+    const double AMP_MAX   = 3.0;
+    double ps = 100.0 - fabs(phase_imb_deg) * (100.0 / PHASE_MAX);
+    double as = 100.0 - fabs(amp_imb_db) * (100.0 / AMP_MAX);
+    if (ps < 0.0) ps = 0.0;
+    if (as < 0.0) as = 0.0;
+    return (ps + as) / 2.0;
+}
+
+// Compute SQI from sub-scores
+//   SQI = 0.40*MER_n + 0.30*CN0_n + 0.20*Skew_n + 0.10*Stability_n
+static inline double calculate_sqi(double mer_n, double cn0_n, double skew_n, double stability_n) {
+    double v = 0.40 * mer_n + 0.30 * cn0_n + 0.20 * skew_n + 0.10 * stability_n;
+    if (v < 0.0)   return 0.0;
+    if (v > 100.0)  return 100.0;
+    return v;
+}
+
+// Grade string from SQI value
+static inline const char* sqi_to_grade(double sqi) {
+    if (sqi >= 90.0) return "Excellent";
+    if (sqi >= 75.0) return "Good";
+    if (sqi >= 55.0) return "Fair";
+    if (sqi >= 30.0) return "Poor";
+    return "Critical";
 }
 
 #endif
