@@ -12,6 +12,7 @@ const uint8_t SYNC_HEADER[4] = {0xFE, 0xCA, 0xFE, 0xCA};
 
 struct SimulationConfig {
     Modulations modulation;
+    SkewScenarios skew;
     int snr;
     bool update_req;
 };
@@ -20,7 +21,22 @@ QueueHandle_t configQueue;
 spi_device_handle_t spi_handle;
 
 Modulations global_mod = QAM16;
+SkewScenarios global_skew = SKEW_PERFECT;
 int global_snr = 1;
+
+// Find the closest available SNR to the requested value
+int findClosestSnr(int requested) {
+    int best = available_snr[0];
+    int best_diff = abs(requested - best);
+    for (size_t i = 1; i < available_snr_count; i++) {
+        int diff = abs((int)available_snr[i] - requested);
+        if (diff < best_diff) {
+            best_diff = diff;
+            best = available_snr[i];
+        }
+    }
+    return best;
+}
 
 void commandTask(void *pvParameters);
 void transmissionTask(void *pvParameters);
@@ -98,7 +114,7 @@ void commandTask(void *pvParameters) {
     char rx_buffer[64];
     int rx_index = 0;
 
-    Serial.println("[Core 0] Command Task Started. Waiting for: AT, MODULACAO, SNR");
+    Serial.println("[Core 0] Command Task Started. Waiting for: AT, MODULACAO, SNR, SKEW");
 
     while (true) {
         if (Serial.available()) {
@@ -127,14 +143,15 @@ bool parseCommand(String cmd) {
     if (cmd == "AT") {
         Serial.println("--- STATUS ATUAL ---");
         Serial.printf("Modulacao: %s\n", GET_MODULATION_NAME(global_mod));
+        Serial.printf("Skew: %s\n", GET_SKEW_NAME(global_skew));
         Serial.printf("SNR: %d dB\n", global_snr);
         return true;
-    } 
-    
+    }
+
     else if (cmd.startsWith("MODULACAO:")) {
         String arg = cmd.substring(10);
         arg.trim();
-        
+
         Modulations new_mod = MODULATIONS_COUNT;
         if (arg == "BPSK") new_mod = BPSK;
         else if (arg == "QPSK") new_mod = QPSK;
@@ -142,33 +159,57 @@ bool parseCommand(String cmd) {
 
         if (new_mod != MODULATIONS_COUNT) {
             global_mod = new_mod;
-            SimulationConfig cfg = {global_mod, global_snr, true};
-            xQueueOverwrite(configQueue, &cfg); 
+            SimulationConfig cfg = {global_mod, global_skew, global_snr, true};
+            xQueueOverwrite(configQueue, &cfg);
             Serial.printf("OK: Modulacao alterada para %s\n", arg.c_str());
         } else {
             Serial.println("ERRO: Modulacao invalida. Use: BPSK, QPSK, QAM16");
         }
         return true;
     }
-    else if (cmd.startsWith("SNR:")) {
-        int new_snr = cmd.substring(4).toInt();
-        
-        bool valid = false;
-        for(size_t i=0; i < available_snr_count; i++) {
-            if(available_snr[i] == new_snr) {
-                valid = true;
+    else if (cmd.startsWith("SKEW:")) {
+        String arg = cmd.substring(5);
+        arg.trim();
+        arg.toLowerCase();
+
+        SkewScenarios new_skew = SKEW_COUNT;
+        for (int i = 0; i < (int)SKEW_COUNT; i++) {
+            String candidate = String(skew_str[i]);
+            candidate.toUpperCase();
+            if (arg == candidate || arg == String(skew_str[i])) {
+                new_skew = (SkewScenarios)i;
                 break;
             }
         }
 
-        if (valid) {
-            global_snr = new_snr;
-            SimulationConfig cfg = {global_mod, global_snr, true};
+        if (new_skew != SKEW_COUNT) {
+            global_skew = new_skew;
+            SimulationConfig cfg = {global_mod, global_skew, global_snr, true};
             xQueueOverwrite(configQueue, &cfg);
-            Serial.printf("OK: SNR alterado para %d dB\n", new_snr);
+            Serial.printf("OK: Skew alterado para %s\n", GET_SKEW_NAME(global_skew));
         } else {
-            Serial.println("ERRO: SNR indisponivel na tabela.");
+            Serial.print("ERRO: Skew invalido. Use: ");
+            for (int i = 0; i < (int)SKEW_COUNT; i++) {
+                Serial.print(skew_str[i]);
+                if (i < (int)SKEW_COUNT - 1) Serial.print(", ");
+            }
+            Serial.println();
         }
+        return true;
+    }
+    else if (cmd.startsWith("MER:")) {
+        int requested_snr = cmd.substring(4).toInt();
+        int closest_snr = findClosestSnr(requested_snr);
+
+        if (closest_snr != requested_snr) {
+            Serial.printf("WARN: MER %d dB indisponivel, usando mais proximo: %d dB\n",
+                          requested_snr, closest_snr);
+        }
+
+        global_snr = closest_snr;
+        SimulationConfig cfg = {global_mod, global_skew, global_snr, true};
+        xQueueOverwrite(configQueue, &cfg);
+        Serial.printf("OK: MER alterado para %d dB\n", global_snr);
         return true;
     }
 
@@ -183,8 +224,8 @@ void transmissionTask(void *pvParameters) {
     const stream_data_t* tx_ptr = nullptr;
     const stream_meta_t* meta_ptr = nullptr;
     
-    tx_ptr = GET_DATA(QAM16, available_snr[0]);  // Start with QAM16
-    meta_ptr = GET_META(QAM16, available_snr[0]);
+    tx_ptr = GET_DATA(QAM16, SKEW_PERFECT, available_snr[0]);  // Start with QAM16
+    meta_ptr = GET_META(QAM16, SKEW_PERFECT, available_snr[0]);
     
     // Packet contains 256 I/Q pairs
     const size_t IQ_PAIRS_PER_PACKET = 256;
@@ -221,11 +262,13 @@ void transmissionTask(void *pvParameters) {
     while (true) {
         // Check for config changes
         if (xQueueReceive(configQueue, &rxConfig, 0) == pdTRUE) {
-            tx_ptr = GET_DATA(rxConfig.modulation, rxConfig.snr);
-            meta_ptr = GET_META(rxConfig.modulation, rxConfig.snr);
+            tx_ptr = GET_DATA(rxConfig.modulation, rxConfig.skew, rxConfig.snr);
+            meta_ptr = GET_META(rxConfig.modulation, rxConfig.skew, rxConfig.snr);
             source_offset = 0; // Reset position
-            Serial.printf("[Core 1] Config changed: %s, SNR %d dB\n", 
-                         GET_MODULATION_NAME(rxConfig.modulation), rxConfig.snr);
+            Serial.printf("[Core 1] Config changed: %s, Skew %s, MER %d dB\n",
+                         GET_MODULATION_NAME(rxConfig.modulation),
+                         GET_SKEW_NAME(rxConfig.skew),
+                         rxConfig.snr);
         }
 
         if (tx_ptr != nullptr && meta_ptr != nullptr) {
