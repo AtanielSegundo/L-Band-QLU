@@ -32,6 +32,8 @@
 
     #include "screen.h"
 
+    #include "websocket.h"
+
 // END
 
 // QLU GLOBAL DEFINITIONS
@@ -53,6 +55,7 @@
     QueueHandle_t xDspQueue;
     QueueHandle_t xToScreenMetrics;
     QueueHandle_t xToWebMetrics;
+    QueueHandle_t xDemodConfig;
 
     #define WEB_REF_SAMPLES_CNT (15U)
 
@@ -61,6 +64,23 @@
         double f_I[WEB_REF_SAMPLES_CNT];
         double f_Q[WEB_REF_SAMPLES_CNT];
     } WebMetrics;
+
+    typedef enum {
+        REQUEST_INFO,
+        REQUEST_CURRENT,
+        REQUEST_UPDATE_YOURS,
+        REQUEST_COUNT
+    } WS_CONFIG_REQUEST_TYPE;
+
+    typedef struct {
+        WS_CONFIG_REQUEST_TYPE T;
+        modulation_type_t mod;
+        ws_client_tpcb ws_client;
+        double roll_off;
+    } ConfigRequest;
+    
+
+    QueueHandle_t xConfigRequest;
 
 // END
 
@@ -105,7 +125,6 @@
 // SERVER RELATED DEFINITIONS
 
     #include "http.h"
-    #include "websocket.h"
 
     #include "routes/index.h"
     #include "routes/ws_only.h"
@@ -199,9 +218,9 @@ void setup_spi_dma() {
     
     spi_set_format(
             SPI_PORT,
-            8,           // 8 bits por transferência
-            SPI_CPOL_1,  // Clock polarity 0
-            SPI_CPHA_1,  // Clock phase 0
+            8,            // 8 bits por transferência
+            SPI_CPOL_1,   // Clock polarity 0
+            SPI_CPHA_1,   // Clock phase 0
             SPI_MSB_FIRST // MSB primeiro
         );
         
@@ -282,18 +301,26 @@ void StreamProcessToMetricsTask(void* params){
         .signal_resolution = 16,
         .modulation = MOD_16QAM
     };
+
     config_calculate_derived(&cfg);
+    
+    xQueueOverwrite(xDemodConfig,&cfg);
+    
     demod_init(&demod,cfg);
 
     double smooth_snr = 0.0;
     double smooth_mer = 0.0;
     double smooth_evm = 0.0;
     double smooth_cn0 = 0.0;
-    
+    double smooth_stability = 100.0;
+    double smooth_skew = 100.0;
+    double smooth_sqi  = 0.0;
+
     bool first_run = true;
-    uint32_t sps_ceil = (uint32_t)ceil(demod.config.samples_per_symbol);
     uint32_t blocks_since_reset = 0;
     const uint32_t RESET_EVERY_N_BLOCKS = 5;
+    const uint32_t SKEW_EVERY_N_BLOCKS  = 20;  // skew needs more samples for stability
+    uint32_t skew_blocks = 0;
 
     double inst_mer = 0.0;
     double inst_snr = 0.0;
@@ -320,8 +347,52 @@ void StreamProcessToMetricsTask(void* params){
     double avg_smp_sig       = 0.0;
     double avg_smp_err       = 0.0;
 
+    // IQ imbalance accumulators (for skew measurement)
+    double sum_I_sq = 0.0;
+    double sum_Q_sq = 0.0;
+    double sum_IQ   = 0.0;
+    uint32_t iq_imb_count = 0;
+
+    // Stability: ring buffer of block powers to compute CV
+    #define STABILITY_WINDOW_CNT 16
+    double power_history[STABILITY_WINDOW_CNT];
+    uint32_t power_hist_idx = 0;
+    uint32_t power_hist_filled = 0;
+    double block_rx_power_sum = 0.0;
+    
+    uint32_t sps_ceil = (uint32_t)ceil(demod.config.samples_per_symbol);
+    
     while (true)
     {
+        if (xQueueReceive(xDemodConfig,&cfg,0) == pdPASS){
+            config_calculate_derived(&cfg);
+            demod_cfg_update(&demod, cfg);
+
+            sps_ceil = (uint32_t)ceil(demod.config.samples_per_symbol);
+
+            // Full reset — purge all stale data from previous modulation
+            demod.sym.acc_i = 0;
+            demod.sym.acc_q = 0;
+            demod.sym.count = 0;
+            demod.sum_symbol_signal_power = 0.0;
+            demod.sum_symbol_error_power  = 0.0;
+            demod.symbol_count            = 0;
+            demod.sum_sample_signal_power = 0.0;
+            demod.sum_sample_error_power  = 0.0;
+            demod.sample_count            = 0;
+            sum_I_sq       = 0.0;
+            sum_Q_sq       = 0.0;
+            sum_IQ         = 0.0;
+            iq_imb_count   = 0;
+            block_rx_power_sum = 0.0;
+            power_hist_filled  = 0;
+            power_hist_idx     = 0;
+            blocks_since_reset = 0;
+            skew_blocks        = 0;
+            smooth_skew        = 100.0;  // reset sentinel for EMA seed
+            first_run = true;
+        }
+        
         // FIXED: Single while with data processing AND queue sending
         if (xQueueReceive(xDspQueue, &rxBlock, 0) == pdPASS) {
             
@@ -339,10 +410,25 @@ void StreamProcessToMetricsTask(void* params){
                     local_web_metrics.f_Q[(k / WEB_REF_SAMPLES_CNT) % WEB_REF_SAMPLES_CNT] = fq;
                 }
 
+                // Stability: accumulate received power (before slicer, cheap)
+                block_rx_power_sum += fi * fi + fq * fq;
+
                 result = get_slicer_by_mod[demod.config.modulation](fi,fq);
                 demod.sum_sample_signal_power += slicer_calculate_power(result.ideal_i,result.ideal_q);
                 demod.sum_sample_error_power  += slicer_calculate_power(fi - result.ideal_i, fq - result.ideal_q);
                 demod.sample_count++;
+
+                // Skew: accumulate ERROR vector I²/Q²/IQ (after slicer)
+                // Using error vectors instead of raw signal fixes BPSK:
+                // raw I²>>Q² for BPSK even with no skew, but error_I²≈error_Q² (AWGN is isotropic)
+                {
+                    double ei = fi - result.ideal_i;
+                    double eq = fq - result.ideal_q;
+                    sum_I_sq += ei * ei;
+                    sum_Q_sq += eq * eq;
+                    sum_IQ   += ei * eq;
+                    iq_imb_count++;
+                }
 
                 demod.sym.acc_i += fi;
                 demod.sym.acc_q += fq;
@@ -367,16 +453,17 @@ void StreamProcessToMetricsTask(void* params){
             avg_sym_sig_power = (demod.symbol_count > 0) ? (demod.sum_symbol_signal_power / demod.symbol_count) : 0.0;
             avg_sym_err_power = (demod.symbol_count > 0) ? (demod.sum_symbol_error_power / demod.symbol_count) : 0.0;
             
+            avg_smp_sig = (demod.sample_count > 0) ? (demod.sum_sample_signal_power / demod.sample_count) : 0.0;
+            avg_smp_err = (demod.sample_count > 0) ? (demod.sum_sample_error_power / demod.sample_count) : 0.0;
+
             if (avg_sym_err_power > 0.000001 && avg_sym_sig_power > 0.000001) {
                 inst_mer = 10.0 * log10(avg_sym_sig_power / avg_sym_err_power);
-                inst_evm = sqrt(avg_sym_err_power / avg_sym_sig_power) * 100.0;
+                // inst_evm = sqrt(avg_sym_err_power / avg_sym_sig_power) * 100.0;
+                inst_evm = sqrt(avg_smp_err / avg_smp_sig) * 100.0;
             } else {
                 inst_mer = 0.0;
                 inst_evm = 0.0;
             }
-
-            avg_smp_sig = (demod.sample_count > 0) ? (demod.sum_sample_signal_power / demod.sample_count) : 0.0;
-            avg_smp_err = (demod.sample_count > 0) ? (demod.sum_sample_error_power / demod.sample_count) : 0.0;
             
             if (avg_smp_err > 0.000001) {
                 inst_snr = 10.0 * log10(avg_smp_sig / avg_smp_err);
@@ -384,8 +471,19 @@ void StreamProcessToMetricsTask(void* params){
                 inst_snr = 0.0;
             }
 
-            inst_cn0 = inst_mer + 10.0 * log10(demod.config.symbol_rate_hz);
-            
+            // inst_cn0 = inst_mer + 10.0 * log10(demod.config.symbol_rate_hz);
+            inst_cn0 = inst_snr + 10.0 * log10(demod.config.symbol_rate_hz);
+
+            // 2b. Stability: store block power (cheap — just an array write)
+            {
+                double block_avg_power = block_rx_power_sum / PROCESS_BLOCK_SIZE;
+                power_history[power_hist_idx] = block_avg_power;
+                power_hist_idx = (power_hist_idx + 1) % STABILITY_WINDOW_CNT;
+                if (power_hist_filled < STABILITY_WINDOW_CNT) power_hist_filled++;
+                block_rx_power_sum = 0.0;
+            }
+
+            // EMA for MER/EVM/SNR/CN0 every block (cheap, no transcendentals beyond the existing log10/sqrt above)
             if (first_run) {
                 smooth_mer = inst_mer;
                 smooth_snr = inst_snr;
@@ -399,27 +497,91 @@ void StreamProcessToMetricsTask(void* params){
                 smooth_cn0 = (EMA_ALPHA * inst_cn0) + ((1.0 - EMA_ALPHA) * smooth_cn0);
             }
 
-            // 3. Update metrics structure
-            local_qlu_metrics.snr = smooth_snr;
-            local_qlu_metrics.mer = smooth_mer;
-            local_qlu_metrics.evm = smooth_evm;
-            local_qlu_metrics.cn0 = smooth_cn0;
-
-            local_web_metrics.m.snr = smooth_snr;
-            local_web_metrics.m.mer = smooth_mer;
-            local_web_metrics.m.evm = smooth_evm;
-            local_web_metrics.m.cn0 = smooth_cn0;
-            
+            // 2c. MER/EVM accumulators reset every N blocks
             blocks_since_reset++;
             if (blocks_since_reset >= RESET_EVERY_N_BLOCKS) {
+                // Stability from power history CV (sqrt)
+                if (power_hist_filled >= 2) {
+                    double sum_p = 0.0, sum_p2 = 0.0;
+                    for (uint32_t w = 0; w < power_hist_filled; w++) {
+                        sum_p  += power_history[w];
+                        sum_p2 += power_history[w] * power_history[w];
+                    }
+                    double mean_p = sum_p / power_hist_filled;
+                    double var_p  = (sum_p2 / power_hist_filled) - (mean_p * mean_p);
+                    if (var_p < 0.0) var_p = 0.0;
+                    double cv = sqrt(var_p) / (mean_p + 1e-12);
+                    const double CV_CEILING = 0.30;
+                    smooth_stability = (1.0 - cv / CV_CEILING) * 100.0;
+                    if (smooth_stability < 0.0)   smooth_stability = 0.0;
+                    if (smooth_stability > 100.0)  smooth_stability = 100.0;
+                }
+
+                // Reset MER/EVM accumulators (short window)
                 demod.sum_symbol_signal_power = 0.0;
                 demod.sum_symbol_error_power  = 0.0;
                 demod.symbol_count            = 0;
                 demod.sum_sample_signal_power = 0.0;
                 demod.sum_sample_error_power  = 0.0;
                 demod.sample_count            = 0;
-                blocks_since_reset = 0;
+                blocks_since_reset            = 0;
             }
+
+            // 2d. Skew — longer accumulation window (20 blocks = ~5120 samples)
+            //     More samples → stable pwr_I/pwr_Q ratio, especially at high SNR
+            skew_blocks++;
+            if (skew_blocks >= SKEW_EVERY_N_BLOCKS && iq_imb_count > 0) {
+                double pwr_I = sum_I_sq / iq_imb_count;
+                double pwr_Q = sum_Q_sq / iq_imb_count;
+                double cross = sum_IQ   / iq_imb_count;
+
+                double amp_imb_db = 10.0 * log10((pwr_I + 1e-12) / (pwr_Q + 1e-12));
+                double denom_skew = sqrt(pwr_I * pwr_Q) + 1e-12;
+                double arg   = 2.0 * cross / denom_skew;
+                if (arg >  1.0) arg =  1.0;
+                if (arg < -1.0) arg = -1.0;
+                double phase_imb_deg = asin(arg) * (180.0 / M_PI);
+                double inst_skew = calculate_skew_score(amp_imb_db, phase_imb_deg);
+
+                // EMA smooth skew like other metrics
+                if (smooth_skew >= 99.9) {
+                    smooth_skew = inst_skew;  // first measurement
+                } else {
+                    smooth_skew = (EMA_ALPHA * inst_skew) + ((1.0 - EMA_ALPHA) * smooth_skew);
+                }
+
+                // Decay accumulators instead of hard reset (keeps history, reduces variance)
+                const double DECAY = 0.3;  // keep 30% of old accumulation
+                sum_I_sq     *= DECAY;
+                sum_Q_sq     *= DECAY;
+                sum_IQ       *= DECAY;
+                iq_imb_count  = (uint32_t)(iq_imb_count * DECAY);
+                skew_blocks   = 0;
+            }
+
+            // 2e. SQI from latest smoothed values (cheap — just multiplies and adds)
+            {
+                double mer_n = normalize_mer(smooth_mer, demod.config.modulation);
+                double cn0_n = normalize_cn0(smooth_cn0);
+                smooth_sqi = calculate_sqi(mer_n, cn0_n, smooth_skew, smooth_stability);
+            }
+
+            // 3. Update metrics structure
+            local_qlu_metrics.snr = smooth_snr;
+            local_qlu_metrics.mer = smooth_snr;
+            local_qlu_metrics.evm = smooth_evm;
+            local_qlu_metrics.cn0 = smooth_cn0;
+            local_qlu_metrics.stability  = smooth_stability;
+            local_qlu_metrics.skew_score = smooth_skew;
+            local_qlu_metrics.sqi        = smooth_sqi;
+
+            local_web_metrics.m.snr = smooth_snr;
+            local_web_metrics.m.mer = smooth_snr;
+            local_web_metrics.m.evm = smooth_evm;
+            local_web_metrics.m.cn0 = smooth_cn0;
+            local_web_metrics.m.stability  = smooth_stability;
+            local_web_metrics.m.skew_score = smooth_skew;
+            local_web_metrics.m.sqi        = smooth_sqi;
 
             // 4. SEND TO QUEUES (NOW INSIDE THE LOOP!)
             
@@ -440,32 +602,34 @@ void StreamProcessToMetricsTask(void* params){
     }
 }
 
-void WebMetricsTojson(char* json_buffer, WebMetrics* metrics, size_t* json_lenght) {
-    // 1. Inicia o JSON com as métricas escalares
-    // Usamos um deslocamento (offset) para ir preenchendo o buffer progressivamente
-    int offset = snprintf(json_buffer, 512, 
-        "{\"snr\":%.2f,\"mer\":%.2f,\"evm\":%.2f,\"cn0\":%.2f,\"points\":[", 
-        metrics->m.snr, metrics->m.mer, metrics->m.evm, metrics->m.cn0);
 
-    // 2. Adiciona os pontos de constelação (f_I, f_Q) para o gráfico da Web
+#define WS_JSON_BUF_SIZE 768
+
+void WebMetricsTojson(char* json_buffer, WebMetrics* metrics, size_t* json_lenght) {
+    const char* grade = sqi_to_grade(metrics->m.sqi);
+
+    int offset = snprintf(json_buffer, WS_JSON_BUF_SIZE,
+        "{\"snr\":%.2f,\"mer\":%.2f,\"evm\":%.2f,\"cn0\":%.2f,"
+        "\"stability\":%.1f,\"skew\":%.1f,\"sqi\":%.1f,\"grade\":\"%s\","
+        "\"points\":[",
+        metrics->m.snr, metrics->m.mer, metrics->m.evm, metrics->m.cn0,
+        metrics->m.stability, metrics->m.skew_score, metrics->m.sqi, grade);
+
     for (uint32_t i = 0; i < WEB_REF_SAMPLES_CNT; i++) {
-        int written = snprintf(json_buffer + offset, 512 - offset,
+        int written = snprintf(json_buffer + offset, WS_JSON_BUF_SIZE - offset,
             "{\"i\":%.3f,\"q\":%.3f}%s",
-            metrics->f_I[i], 
+            metrics->f_I[i],
             metrics->f_Q[i],
-            (i < WEB_REF_SAMPLES_CNT - 1) ? "," : ""); // Vírgula apenas entre elementos
-        
+            (i < WEB_REF_SAMPLES_CNT - 1) ? "," : "");
+
         offset += written;
-        
-        // Proteção contra estouro de buffer durante a montagem do array
-        if (offset >= 510) break; 
+
+        if (offset >= (WS_JSON_BUF_SIZE - 2)) break;
     }
 
-    // 3. Fecha o JSON
-    int final_bits = snprintf(json_buffer + offset, 512 - offset, "]}");
+    int final_bits = snprintf(json_buffer + offset, WS_JSON_BUF_SIZE - offset, "]}");
     offset += final_bits;
 
-    // 4. Retorna o comprimento real da string gerada
     if (json_lenght != NULL) {
         *json_lenght = (size_t)offset;
     }
@@ -473,7 +637,7 @@ void WebMetricsTojson(char* json_buffer, WebMetrics* metrics, size_t* json_lengh
 
 void WebStreamMetricsTask(void* parameters){
     WebMetrics local_metrics = {0};
-    static char ws_stream_json[512];
+    static char ws_stream_json[WS_JSON_BUF_SIZE];
     size_t ws_stream_lenght = 0;
 
     for(;;){
@@ -487,9 +651,146 @@ void WebStreamMetricsTask(void* parameters){
     }   
 };
 
+static char handle_msg_buffer[512];
+void handle_text_requests(ws_client_tpcb wc, uint8_t* ws_msg, size_t ws_msg_len){
+    const char* route = ws_get_client_route(wc);
+    static char msg_buffer[512];
+    static ConfigRequest req = {0};
+
+    // Verifica se a rota é correta
+    if(strcmp(route, "/ws/config") == 0){
+        
+        size_t safe_len = (ws_msg_len < 511) ? ws_msg_len : 511;
+        memcpy(msg_buffer, ws_msg, safe_len);
+        msg_buffer[safe_len] = '\0';
+
+        req.ws_client = wc;
+        bool valid_request = false;
+
+        if (strstr(msg_buffer, "INFO") != NULL) {
+            req.T = REQUEST_INFO;
+            valid_request = true;
+        }
+        
+        else if (strstr(msg_buffer, "CURRENT") != NULL) {
+            req.T = REQUEST_CURRENT;
+            valid_request = true;
+        }
+
+        else if (strstr(msg_buffer, "UPDATE_YOURS") != NULL) {
+            req.T = REQUEST_UPDATE_YOURS;
+            valid_request = true;
+
+            char* mod_key = strstr(msg_buffer, "\"modulation\"");
+            if (mod_key) {
+                char* val_start = strchr(mod_key, ':');
+                if (val_start) {
+                    // CORREÇÃO: Adicionado +1 para pular o ':' 
+                    // Antes: atoi(val_start) -> lia ":" -> retornava 0
+                    // Agora: atoi(val_start + 1) -> lê " 2" -> retorna 2
+                    // printf("[DEBUG] Mode Key STR: %s\n",val_start+1);
+                    req.mod = (modulation_type_t)atoi(val_start + 1);
+                    // printf("[DEBUG] MODE KEY PARSED %s\n",get_modulation_name[req.mod]);
+                }
+            }
+
+            char* roll_key = strstr(msg_buffer, "\"roll_off\"");
+            if (roll_key) {
+                char* val_start = strchr(roll_key, ':');
+                if (val_start) {
+                    // Já estava correto, mas mantenha o +1 aqui também
+                    // printf("[DEBUG] ROLL OFF STR: %s\n",val_start);
+                    req.roll_off = atof(val_start + 1);
+                    // printf("[DEBUG] ROLL OFF PARSED: %lf\n",req.roll_off);
+                }
+            }
+
+        }
+        if (valid_request) {
+            xQueueSend(xConfigRequest, &req, pdMS_TO_TICKS(10));
+        }
+    };
+}
+
+void renderInfoRequestJson(char* json_buf, size_t* json_len, size_t buf_len){
+    int offset = 0;
+    offset += snprintf(json_buf, buf_len, "{\"options\": [");
+    
+    for (size_t i = 0; i < MOD_NUM_MODULATIONS; i++) {
+        if (i > 0) {
+            offset += snprintf(json_buf + offset, buf_len - offset, ",");
+        }
+        
+        offset += snprintf(json_buf + offset, buf_len - offset, 
+                           "{\"name\": \"%s\", \"val\": %d}", 
+                           get_modulation_name[i], i);
+    }
+    
+    offset += snprintf(json_buf + offset, buf_len - offset, "]}");
+    *json_len = offset;
+};
 
 void WebConfigProcessTask(void* parameters){
-    // PASS
+    // CORREÇÃO 3: Inicializa com os mesmos defaults do DSP para não mostrar 0 no início
+    demod_config_t local_cfg = {
+        .link_bw_hz = 10e6,
+        .sampling_rate_hz = 20e6,
+        .roll_off = 0.25,
+        .signal_resolution = 16,
+        .modulation = MOD_16QAM
+    };
+    config_calculate_derived(&local_cfg);
+
+    ConfigRequest local_cfg_request = {0};
+    static char ws_config_json[512];
+    size_t ws_config_lenght = 0;
+
+    ws_add_on_text_handler(handle_text_requests);
+
+    for(;;){
+        // CORREÇÃO 4: Removemos a leitura de xDemodConfig aqui. 
+        // Esta task mantém o estado em 'local_cfg' e apenas ENVIA para o DSP.
+        // Se ela ler a fila, rouba a configuração da task de DSP.
+        
+        if (xQueueReceive(xConfigRequest, &local_cfg_request, 0) == pdPASS){
+            if (xSemaphoreTake(lwip_mutex, portMAX_DELAY)){
+                
+                switch (local_cfg_request.T)
+                {
+                    case REQUEST_INFO:
+                        renderInfoRequestJson(ws_config_json, &ws_config_lenght, 512);
+                        ws_send_message(local_cfg_request.ws_client, WS_OP_TEXT, (uint8_t*)ws_config_json, ws_config_lenght);
+                        break;
+                    
+                    case REQUEST_CURRENT:
+                        // CORREÇÃO 2: Envia 'modulation' como inteiro (%d) para casar com o value do <select>
+                        ws_config_lenght = snprintf(ws_config_json, 512, 
+                                           "{\"modulation\": %d, \"roll_off\": %.2f}",
+                                           local_cfg.modulation, local_cfg.roll_off);
+                        
+                        ws_send_message(local_cfg_request.ws_client, WS_OP_TEXT, (uint8_t*)ws_config_json, ws_config_lenght);
+                        break;
+                    
+                    case REQUEST_UPDATE_YOURS:
+                        // Atualiza estado local
+                        local_cfg.modulation = local_cfg_request.mod;
+                        local_cfg.roll_off   = local_cfg_request.roll_off;
+                        
+                        config_calculate_derived(&local_cfg);
+                        
+                        xQueueOverwrite(xDemodConfig, &local_cfg);
+                        break;
+                        
+                    default:
+                        break;
+                }
+
+                xSemaphoreGive(lwip_mutex);
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100)); // Delay reduzido para resposta mais ágil da UI
+    }
 };
 
 void UpdateScreenTask(void* params){
@@ -912,6 +1213,16 @@ void serverTask(void *p){
         NULL
     );
 
+    xTaskCreateAffinitySet(
+        WebConfigProcessTask,
+        "Web Config Process Task",
+        1024,
+        NULL,
+        5,
+        RP2040_CORE_0,
+        NULL
+    );
+
     for(;;){
         if (xSemaphoreTake(lwip_mutex, portMAX_DELAY)){
             cyw43_arch_poll();
@@ -936,6 +1247,8 @@ int main()
     
     xToScreenMetrics = xQueueCreate(1, sizeof(QLUMetrics));
     xToWebMetrics    = xQueueCreate(1, sizeof(WebMetrics));
+    xDemodConfig     = xQueueCreate(1, sizeof(demod_config_t));
+    xConfigRequest   = xQueueCreate(1, sizeof(ConfigRequest)); 
     lwip_mutex = xSemaphoreCreateMutex();
 
     // Core 1: Gerencia o buffer DMA e monta os pacotes para o processamento
