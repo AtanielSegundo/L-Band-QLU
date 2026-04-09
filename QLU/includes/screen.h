@@ -192,11 +192,12 @@ o Screen TFT ST7735.
                              uint16_t box_color,
                              QLUMetrics* qm
     ){
-        char buffer[32];
+        static char buffer[128];
+        static char sqi_text[64];
         const uint8_t FIXED_FONT_HEIGHT = 8;
         
         uint8_t line_height = FIXED_FONT_HEIGHT + pad;
-        uint8_t total_height = 3 * line_height + 2;
+        uint8_t total_height = 5 * line_height + 2;
         
         ssd1306_clear_rect_area(0, 0, ssd1306_width, total_height);
 
@@ -204,19 +205,37 @@ o Screen TFT ST7735.
 
         // snprintf(buffer, sizeof(buffer), "SNR: %.2f dB", qm->snr);
         // ssd1306_draw_string((uint8_t*)ssd, 0, cursor_y, buffer);
+    
+        snprintf(buffer, sizeof(buffer), "SQI:%.2f%%", qm->sqi);
+        ssd1306_draw_string((uint8_t*)ssd, 0, cursor_y, buffer);
+        cursor_y += line_height;
+
+        if (qm->sqi >= 90){
+            snprintf(sqi_text, sizeof(sqi_text), "EXCELENTE");
+        } else if (qm->sqi >= 75){
+            snprintf(sqi_text, sizeof(sqi_text), "BOM");
+        } else if (qm->sqi >= 55){
+            snprintf(sqi_text, sizeof(sqi_text), "REGULAR");
+        } else if (qm->sqi >= 30){
+            snprintf(sqi_text, sizeof(sqi_text), "RUIM");
+        } else{
+            snprintf(sqi_text, sizeof(sqi_text), "CRÍTICO");
+        }
+        snprintf(buffer, sizeof(buffer), "STATUS:%s",sqi_text);
+        ssd1306_draw_string((uint8_t*)ssd, 0, cursor_y, buffer);
         
         cursor_y += line_height;
-        snprintf(buffer, sizeof(buffer), "MER: %.2f dB", qm->mer);
+        snprintf(buffer, sizeof(buffer), "mer:%.2f dB", qm->mer);
         ssd1306_draw_string((uint8_t*)ssd, 0, cursor_y, buffer);
 
         cursor_y += line_height;
-        snprintf(buffer, sizeof(buffer), "CN0: %.2f dB-Hz", qm->cn0);
+        snprintf(buffer, sizeof(buffer), "CN0:%.2f dB-Hz", qm->cn0);
         ssd1306_draw_string((uint8_t*)ssd, 0, cursor_y, buffer);
 
         cursor_y += line_height;
-        snprintf(buffer, sizeof(buffer), "evm: %.2f%%", qm->evm);
+        snprintf(buffer, sizeof(buffer), "skew:%.2f%%", qm->skew_score);
         ssd1306_draw_string((uint8_t*)ssd, 0, cursor_y, buffer);
-
+        
         render_on_display((uint8_t*)ssd, (struct render_area*)&frame_area);
     }
 

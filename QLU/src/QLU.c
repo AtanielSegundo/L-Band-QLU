@@ -37,7 +37,7 @@
 // END
 
 // QLU GLOBAL DEFINITIONS
-
+    
     #define SPI_PORT_FREQUENCY (1 * 1000 * 1000)
     #define SPI_PORT spi0
     #define PIN_RX   16
